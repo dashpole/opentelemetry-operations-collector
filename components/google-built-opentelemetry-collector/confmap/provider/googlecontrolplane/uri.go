@@ -40,8 +40,14 @@ type ParsedURI struct {
 	FleetID        string        // Query parameter: gcp.fleet_id
 	Project        string        // Query parameter: project
 	BaseConfigURI  string        // Query parameter: base_config
-	StartupTimeout time.Duration // Query parameter: startup_timeout
-	QueryParams    url.Values    // Raw query parameters
+	StartupTimeout       time.Duration // Query parameter: startup_timeout
+	ServerAuthority      string        // Query parameter: authority or server_authority
+	CACertPath           string        // Query parameter: ca_cert or ca_cert_path
+	ClientCertPath       string        // Query parameter: client_cert or client_cert_path
+	ClientKeyPath        string        // Query parameter: client_key or client_key_path
+	Insecure             bool          // Query parameter: insecure=true
+	FailOnStartupTimeout bool          // Query parameter: fail_on_startup_timeout=true
+	QueryParams          url.Values    // Raw query parameters
 }
 
 // ParseURI parses and validates a raw googlecontrolplane URI.
@@ -82,7 +88,13 @@ func ParseURI(rawURI string) (*ParsedURI, error) {
 	}
 
 	fleetID := queryVals.Get("gcp.fleet_id")
+	if fleetID == "" {
+		fleetID = queryVals.Get("fleet_id")
+	}
 	project := queryVals.Get("project")
+	if project == "" {
+		project = queryVals.Get("project_id")
+	}
 	baseConfig := queryVals.Get("base_config")
 
 	var startupTimeout time.Duration
@@ -168,15 +180,40 @@ func ParseURI(rawURI string) (*ParsedURI, error) {
 		return nil, fmt.Errorf("could not determine transport from URI: %s", rawURI)
 	}
 
+	authority := queryVals.Get("authority")
+	if authority == "" {
+		authority = queryVals.Get("server_authority")
+	}
+	caCert := queryVals.Get("ca_cert")
+	if caCert == "" {
+		caCert = queryVals.Get("ca_cert_path")
+	}
+	clientCert := queryVals.Get("client_cert")
+	if clientCert == "" {
+		clientCert = queryVals.Get("client_cert_path")
+	}
+	clientKey := queryVals.Get("client_key")
+	if clientKey == "" {
+		clientKey = queryVals.Get("client_key_path")
+	}
+	insecure := queryVals.Get("insecure") == "true"
+	failOnTimeout := queryVals.Get("fail_on_startup_timeout") == "true"
+
 	return &ParsedURI{
-		Raw:            rawURI,
-		Transport:      transport,
-		Endpoint:       endpoint,
-		Path:           path,
-		FleetID:        fleetID,
-		Project:        project,
-		BaseConfigURI:  baseConfig,
-		StartupTimeout: startupTimeout,
-		QueryParams:    queryVals,
+		Raw:                  rawURI,
+		Transport:            transport,
+		Endpoint:             endpoint,
+		Path:                 path,
+		FleetID:              fleetID,
+		Project:              project,
+		BaseConfigURI:        baseConfig,
+		StartupTimeout:       startupTimeout,
+		ServerAuthority:      authority,
+		CACertPath:           caCert,
+		ClientCertPath:       clientCert,
+		ClientKeyPath:        clientKey,
+		Insecure:             insecure,
+		FailOnStartupTimeout: failOnTimeout,
+		QueryParams:          queryVals,
 	}, nil
 }

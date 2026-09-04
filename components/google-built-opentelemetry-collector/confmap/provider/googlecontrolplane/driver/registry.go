@@ -18,6 +18,8 @@ import (
 	"context"
 	"sync"
 
+	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/extension/filepolicy"
+	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/extension/googlexdspolicy"
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/processor/policyprocessor"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/filelogreceiver"
 	"go.opentelemetry.io/collector/component"
@@ -104,6 +106,8 @@ func NewDefaultRegistry() *PolicyDriverRegistry {
 
 	reg.RegisterExtensionFactory(NewGoogleClientAuthExtensionFactory())
 	reg.RegisterExtensionFactory(NewGoogleControlPlaneExtensionFactory())
+	reg.RegisterExtensionFactory(googlexdspolicy.NewFactory())
+	reg.RegisterExtensionFactory(filepolicy.NewFactory())
 
 	return reg
 }

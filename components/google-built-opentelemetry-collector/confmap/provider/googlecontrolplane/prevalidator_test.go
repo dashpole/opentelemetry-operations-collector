@@ -103,7 +103,7 @@ func TestPreValidator(t *testing.T) {
 		assert.Equal(t, "undeclared_extension", logs[0].ContextMap()["component_id"])
 	})
 
-	t.Run("Empty pipelines fails", func(t *testing.T) {
+	t.Run("Empty pipelines allowed for composable provider", func(t *testing.T) {
 		observedZapCore, observedLogs := observer.New(zap.ErrorLevel)
 		pv := NewPreValidator(reg, zap.New(observedZapCore))
 
@@ -111,10 +111,8 @@ func TestPreValidator(t *testing.T) {
 		conf["service"].(map[string]any)["pipelines"] = map[string]any{}
 
 		err := pv.Validate(conf)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "service must configure at least one pipeline")
-		require.Len(t, observedLogs.All(), 1)
-		assert.Equal(t, EventPolicyCompilationFailed, observedLogs.All()[0].ContextMap()["event.name"])
+		require.NoError(t, err)
+		assert.Empty(t, observedLogs.All())
 	})
 
 	t.Run("Empty receivers in pipeline fails", func(t *testing.T) {
@@ -279,12 +277,12 @@ func TestPreValidator(t *testing.T) {
 
 		err := pv.Validate(conf)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "service must configure at least one pipeline")
+		assert.Contains(t, err.Error(), "service configuration is invalid or missing")
 
 		conf["service"] = nil
 		err = pv.Validate(conf)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "service must configure at least one pipeline")
+		assert.Contains(t, err.Error(), "service configuration is invalid or missing")
 		require.NotEmpty(t, observedLogs.All())
 	})
 

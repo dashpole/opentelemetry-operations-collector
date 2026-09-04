@@ -72,21 +72,17 @@ func (pv *PreValidator) Validate(conf map[string]any) error {
 		}
 	}
 
-	// 2. Validate service.pipelines structural integrity & cross-references
+	// 2. Validate service.pipelines structural integrity & cross-references when configured.
 	if service == nil {
-		err := fmt.Errorf("service must configure at least one pipeline")
+		err := fmt.Errorf("service configuration is invalid or missing")
 		pv.emitFailure("service", err)
 		return err
 	}
 
-	pipelines, _ := service["pipelines"].(map[string]any)
-	if len(pipelines) == 0 {
-		err := fmt.Errorf("service must configure at least one pipeline")
-		pv.emitFailure("service.pipelines", err)
-		return err
-	}
-
-	for pipeName, pipeData := range pipelines {
+	// In composable configuration models (e.g. filter-only payloads or external base configs),
+	// synthesizing zero pipelines is valid under Zero Empty Pipeline Synthesis.
+	if pipelines, ok := service["pipelines"].(map[string]any); ok && len(pipelines) > 0 {
+		for pipeName, pipeData := range pipelines {
 		pMap, ok := pipeData.(map[string]any)
 		if !ok {
 			err := fmt.Errorf("pipeline %s configuration is invalid", pipeName)
@@ -140,6 +136,7 @@ func (pv *PreValidator) Validate(conf map[string]any) error {
 				return err
 			}
 		}
+	}
 	}
 
 	// 3. In-Tree Component Config Validation across ALL component categories

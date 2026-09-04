@@ -79,8 +79,12 @@ exporters:
 - gomod: go.opentelemetry.io/collector/exporter/otlphttpexporter v0.159.0
 
 extensions:
+- gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/extension/filepolicy v0.159.0
+  path: ../components/google-built-opentelemetry-collector/extension/filepolicy
 - gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/extension/googlecontrolplaneextension v0.159.0
   path: ../components/google-built-opentelemetry-collector/extension/googlecontrolplaneextension
+- gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/extension/googlexdspolicy v0.159.0
+  path: ../components/google-built-opentelemetry-collector/extension/googlexdspolicy
 - gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/extension/healthagent v0.159.0
   path: ../components/google-built-opentelemetry-collector/extension/healthagent
 - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/ackextension v0.159.0
@@ -126,6 +130,8 @@ providers:
 replaces:
 # Reference root module of repository to find dependency packages.
 - github.com/GoogleCloudPlatform/opentelemetry-operations-collector => ../../
+# Reference local controlplane package.
+- github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/pkg/controlplane => ../../components/google-built-opentelemetry-collector/pkg/controlplane
 # Force update buger/jsonparser to v1.1.2 to fix vulnerability
 - github.com/buger/jsonparser => github.com/buger/jsonparser v1.1.2
 

@@ -31,13 +31,85 @@ type ConfigCompiler struct {
 	registry    *driver.PolicyDriverRegistry
 	logger      *zap.Logger
 	fleetID     string
-	collectorID string
-	baseConfig  map[string]any
-	fileReader  func(string) ([]byte, error)
+	collectorID     string
+	baseConfig      map[string]any
+	fileReader      func(string) ([]byte, error)
+	transport       string
+	projectID       string
+	endpoint        string
+	path            string
+	insecure        bool
+	serverAuthority string
+	caCertPath      string
+	clientCertPath  string
+	clientKeyPath   string
 }
 
 // CompilerOption configures a ConfigCompiler.
 type CompilerOption func(*ConfigCompiler)
+
+// WithCompilerTransport sets the policy transport scheme (e.g. "xds" or "file").
+func WithCompilerTransport(transport string) CompilerOption {
+	return func(c *ConfigCompiler) {
+		c.transport = transport
+	}
+}
+
+// WithCompilerEndpoint sets the endpoint for xDS transport.
+func WithCompilerEndpoint(endpoint string) CompilerOption {
+	return func(c *ConfigCompiler) {
+		c.endpoint = endpoint
+	}
+}
+
+// WithCompilerPath sets the file path for file transport.
+func WithCompilerPath(path string) CompilerOption {
+	return func(c *ConfigCompiler) {
+		c.path = path
+	}
+}
+
+// WithCompilerProjectID sets the GCP project ID.
+func WithCompilerProjectID(projectID string) CompilerOption {
+	return func(c *ConfigCompiler) {
+		c.projectID = projectID
+	}
+}
+
+// WithCompilerInsecure sets whether the xDS connection is insecure.
+func WithCompilerInsecure(insecure bool) CompilerOption {
+	return func(c *ConfigCompiler) {
+		c.insecure = insecure
+	}
+}
+
+// WithCompilerServerAuthority sets the server authority header for xDS.
+func WithCompilerServerAuthority(serverAuthority string) CompilerOption {
+	return func(c *ConfigCompiler) {
+		c.serverAuthority = serverAuthority
+	}
+}
+
+// WithCompilerCACertPath sets the CA certificate path for xDS.
+func WithCompilerCACertPath(caCertPath string) CompilerOption {
+	return func(c *ConfigCompiler) {
+		c.caCertPath = caCertPath
+	}
+}
+
+// WithCompilerClientCertPath sets the client certificate path for xDS.
+func WithCompilerClientCertPath(clientCertPath string) CompilerOption {
+	return func(c *ConfigCompiler) {
+		c.clientCertPath = clientCertPath
+	}
+}
+
+// WithCompilerClientKeyPath sets the client private key path for xDS.
+func WithCompilerClientKeyPath(clientKeyPath string) CompilerOption {
+	return func(c *ConfigCompiler) {
+		c.clientKeyPath = clientKeyPath
+	}
+}
 
 // WithCompilerFleetID sets the fleet ID in the compiler context.
 func WithCompilerFleetID(fleetID string) CompilerOption {
@@ -110,8 +182,51 @@ func (c *ConfigCompiler) Compile(policies []*v3.TypedExtensionConfig) (map[strin
 	// Register policy/global token and initialize empty policy array
 	resolvedTokens["global_policy_processor"] = "policy/global"
 	globalPolicyRules := make([]any, 0)
-	extensions["googlecontrolplaneextension"] = map[string]any{}
-	serviceExts = appendSliceUnique(serviceExts, "googlecontrolplaneextension")
+
+	var informerExtName string
+	if c.transport == "file" {
+		informerExtName = "filepolicy"
+		fileCfg := map[string]any{
+			"path": c.path,
+		}
+		extensions[informerExtName] = fileCfg
+		serviceExts = appendSliceUnique(serviceExts, informerExtName)
+	} else {
+		informerExtName = "googlexdspolicy"
+		endpoint := c.endpoint
+		if endpoint == "" {
+			endpoint = "telemetrydirector.googleapis.com:443"
+		}
+		xdsCfg := map[string]any{
+			"endpoint": endpoint,
+		}
+		if c.fleetID != "" {
+			xdsCfg["fleet_id"] = c.fleetID
+		}
+		if c.projectID != "" {
+			xdsCfg["project_id"] = c.projectID
+		}
+		if c.collectorID != "" {
+			xdsCfg["collector_id"] = c.collectorID
+		}
+		if c.serverAuthority != "" {
+			xdsCfg["server_authority"] = c.serverAuthority
+		}
+		if c.caCertPath != "" {
+			xdsCfg["ca_cert_path"] = c.caCertPath
+		}
+		if c.clientCertPath != "" {
+			xdsCfg["client_cert_path"] = c.clientCertPath
+		}
+		if c.clientKeyPath != "" {
+			xdsCfg["client_key_path"] = c.clientKeyPath
+		}
+		if c.insecure {
+			xdsCfg["insecure"] = true
+		}
+		extensions[informerExtName] = xdsCfg
+		serviceExts = appendSliceUnique(serviceExts, informerExtName)
+	}
 
 	// Telemetry resource attributes (declarative format for otelconftelemetry)
 	telemetryAttrs := make([]any, 0)
@@ -166,8 +281,7 @@ func (c *ConfigCompiler) Compile(policies []*v3.TypedExtensionConfig) (map[strin
 	}
 
 	// Stage 2: Active Destination Synthesis
-	// If no explicit destination policy is present, default to GCP destination
-	activeDestExporter := "otlp/gcp_destination"
+	var activeDestExporter string
 	signalBatchProcessors := map[string]string{
 		"metrics": "batch/gcp_destination_metrics",
 		"logs":    "batch/gcp_destination_logs",
@@ -177,8 +291,7 @@ func (c *ConfigCompiler) Compile(policies []*v3.TypedExtensionConfig) (map[strin
 	var destDriver driver.PolicyDriver
 	if destPolicy != nil {
 		destDriver = c.registry.GetDriver(destPolicy.TypedConfig.TypeUrl)
-	}
-	if destDriver == nil {
+	} else if c.baseConfig == nil && len(policies) == 0 {
 		destDriver = c.registry.GetDriver(driver.TypeURLGcpDestination)
 	}
 
@@ -198,6 +311,7 @@ func (c *ConfigCompiler) Compile(policies []*v3.TypedExtensionConfig) (map[strin
 		mergeMap(processors, frag.Processors)
 		serviceExts = appendSliceUnique(serviceExts, frag.ServiceExts...)
 
+		activeDestExporter = "otlp/gcp_destination"
 		if tokenExp, ok := resolvedTokens["active_destination_exporter"]; ok && tokenExp != "" {
 			activeDestExporter = tokenExp
 		}
@@ -229,41 +343,37 @@ func (c *ConfigCompiler) Compile(policies []*v3.TypedExtensionConfig) (map[strin
 		}
 	}
 
-	processors["policy/global"] = map[string]any{
-		"policies": globalPolicyRules,
+	policyGlobalMap := map[string]any{
+		"informer_extensions": []any{informerExtName},
 	}
+	if len(globalPolicyRules) > 0 {
+		policyGlobalMap["policies"] = globalPolicyRules
+	}
+	processors["policy/global"] = policyGlobalMap
 
 	// Stage 4: Source Policy Pipeline Wiring
-	// If no sources provided, default to OTLP source
+	signalReceivers := make(map[string][]string)
+
 	if len(sourcePolicies) == 0 {
-		otlpDrv := c.registry.GetDriver(driver.TypeURLOtlpSource)
-		if otlpDrv != nil {
-			frag, err := otlpDrv.GenerateConfig(nil, &driver.CompilationContext{
-				FleetID:        c.fleetID,
-				CollectorID:    c.collectorID,
-				ResolvedTokens: resolvedTokens,
-			})
-			if err == nil {
-				mergeMap(receivers, frag.Receivers)
-			}
-		}
-		// Default signal pipelines
-		for _, signal := range []string{"metrics", "logs", "traces"} {
-			batchProc := signalBatchProcessors[signal]
-			pipeProcs := []any{"policy/global"}
-			if batchProc != "" && processors[batchProc] != nil {
-				pipeProcs = append(pipeProcs, batchProc)
-			}
-			service["pipelines"].(map[string]any)[signal] = map[string]any{
-				"receivers":  []any{"otlp"},
-				"processors": pipeProcs,
-				"exporters":  []any{activeDestExporter},
+		if c.baseConfig == nil && len(policies) == 0 {
+			otlpDrv := c.registry.GetDriver(driver.TypeURLOtlpSource)
+			if otlpDrv != nil {
+				frag, err := otlpDrv.GenerateConfig(nil, &driver.CompilationContext{
+					FleetID:        c.fleetID,
+					CollectorID:    c.collectorID,
+					ResolvedTokens: resolvedTokens,
+				})
+				if err == nil {
+					mergeMap(receivers, frag.Receivers)
+					for signal, pipe := range frag.Pipelines {
+						for _, r := range pipe.Receivers {
+							signalReceivers[signal] = appendSliceUnique(signalReceivers[signal], r)
+						}
+					}
+				}
 			}
 		}
 	} else {
-		// Aggregate signal receivers across all source policies
-		signalReceivers := make(map[string][]string)
-
 		for _, sp := range sourcePolicies {
 			drv := c.registry.GetDriver(sp.TypedConfig.TypeUrl)
 			if drv == nil {
@@ -287,9 +397,15 @@ func (c *ConfigCompiler) Compile(policies []*v3.TypedExtensionConfig) (map[strin
 				}
 			}
 		}
+	}
 
-		// Assemble final signal pipelines: receiver -> policy/global -> batch -> exporter
+	// Zero Empty Pipeline Synthesis:
+	// ONLY synthesize a pipeline if BOTH source receivers AND an active destination exporter exist for that signal.
+	if activeDestExporter != "" {
 		for signal, recvs := range signalReceivers {
+			if len(recvs) == 0 {
+				continue
+			}
 			batchProc := signalBatchProcessors[signal]
 			pipeProcs := []any{"policy/global"}
 			if batchProc != "" && processors[batchProc] != nil {
@@ -301,7 +417,8 @@ func (c *ConfigCompiler) Compile(policies []*v3.TypedExtensionConfig) (map[strin
 				recvAny[i] = r
 			}
 
-			service["pipelines"].(map[string]any)[signal] = map[string]any{
+			pipelineKey := signal + "/googlecontrolplane"
+			service["pipelines"].(map[string]any)[pipelineKey] = map[string]any{
 				"receivers":  recvAny,
 				"processors": pipeProcs,
 				"exporters":  []any{activeDestExporter},
@@ -333,8 +450,8 @@ func (c *ConfigCompiler) Compile(policies []*v3.TypedExtensionConfig) (map[strin
 
 // mergeWithBaseConfig merges synthesized configuration with a user-provided base configuration.
 // Merge semantics:
-//  1. policy/global is injected into managed pipelines directly before the first batch or queue processor.
-//     Fallback: If no batch or queue processor is present, policy/global is appended before exporters.
+//  1. Synthesized pipelines are namespaced under service.pipelines.<signal>/googlecontrolplane,
+//     preserving user pipelines untouched without implicit injection.
 //  2. service.telemetry attributes in base config are preserved; service.instance.id & gcp.fleet_id are added.
 //  3. Components (receivers, processors, exporters, extensions) are deeply merged without duplicate processor entries.
 func (c *ConfigCompiler) mergeWithBaseConfig(base map[string]any, synthesized map[string]any) map[string]any {

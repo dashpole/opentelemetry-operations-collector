@@ -16,119 +16,123 @@ package googlecontrolplane
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/confmap/provider/googlecontrolplane/ingestor"
-	policyv1alpha1 "github.com/GoogleCloudPlatform/opentelemetry-operations-collector/gen/go/policy/v1alpha1"
-	xdsv1alpha1 "github.com/GoogleCloudPlatform/opentelemetry-operations-collector/gen/go/xds/v1alpha1"
+	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/confmap/provider/googlecontrolplane/driver"
+	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/pkg/controlplane"
 	v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/confmap"
 	"go.uber.org/zap/zaptest"
-	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/anypb"
 )
 
-type mockPolicyIngestor struct {
-	mu       sync.Mutex
-	onUpdate func(ingestor.PolicyUpdate) error
-	startErr error
-	stopErr  error
-	started  bool
-	stopped  bool
-	acks     []ingestor.PolicyAck
+type mockInformerClient struct {
+	mu                sync.Mutex
+	status            *controlplane.StatusRegistry
+	structuralHandler controlplane.StructuralUpdateHandler
+	readyCh           chan struct{}
+	readyOnce         sync.Once
+	closed            bool
+	policies          []*v3.TypedExtensionConfig
 }
 
-func (m *mockPolicyIngestor) Start(ctx context.Context, onUpdate func(ingestor.PolicyUpdate) error) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.startErr != nil {
-		return m.startErr
+func newMockInformerClient() *mockInformerClient {
+	return &mockInformerClient{
+		status:  controlplane.NewStatusRegistry(),
+		readyCh: make(chan struct{}),
 	}
-	m.started = true
-	m.onUpdate = onUpdate
+}
+
+func (m *mockInformerClient) List(typeURL string) ([]*v3.TypedExtensionConfig, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.policies, nil
+}
+
+func (m *mockInformerClient) Watch(ctx context.Context, typeURL string) (<-chan controlplane.PolicyWatchEvent, error) {
+	ch := make(chan controlplane.PolicyWatchEvent, 10)
+	return ch, nil
+}
+
+func (m *mockInformerClient) Ready() <-chan struct{} {
+	return m.readyCh
+}
+
+func (m *mockInformerClient) MarkReady() {
+	m.readyOnce.Do(func() {
+		close(m.readyCh)
+	})
+}
+
+func (m *mockInformerClient) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.closed = true
+	m.MarkReady()
 	return nil
 }
 
-func (m *mockPolicyIngestor) Stop(ctx context.Context) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.stopped = true
-	return m.stopErr
+func (m *mockInformerClient) Status() *controlplane.StatusRegistry {
+	return m.status
 }
 
-func (m *mockPolicyIngestor) Acknowledge(ctx context.Context, ack ingestor.PolicyAck) error {
+func (m *mockInformerClient) RegisterStructuralHandler(handler controlplane.StructuralUpdateHandler) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.acks = append(m.acks, ack)
-	return nil
+	m.structuralHandler = handler
 }
 
-func (m *mockPolicyIngestor) Trigger(update ingestor.PolicyUpdate) error {
+func (m *mockInformerClient) TriggerStructural(ctx context.Context, policies []*v3.TypedExtensionConfig, revision string) error {
 	m.mu.Lock()
-	fn := m.onUpdate
+	m.policies = policies
+	handler := m.structuralHandler
 	m.mu.Unlock()
-	if fn != nil {
-		return fn(update)
+	if handler == nil {
+		for i := 0; i < 50; i++ {
+			time.Sleep(10 * time.Millisecond)
+			m.mu.Lock()
+			handler = m.structuralHandler
+			m.mu.Unlock()
+			if handler != nil {
+				break
+			}
+		}
 	}
+	if handler != nil {
+		err := handler(ctx, controlplane.PolicySnapshotUpdate{
+			Policies: policies,
+			Revision: revision,
+		})
+		if err == nil {
+			m.MarkReady()
+		}
+		return err
+	}
+	m.MarkReady()
 	return nil
 }
 
-func (m *mockPolicyIngestor) Acks() []ingestor.PolicyAck {
+func (m *mockInformerClient) IsClosed() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	res := make([]ingestor.PolicyAck, len(m.acks))
-	copy(res, m.acks)
-	return res
-}
-
-func (m *mockPolicyIngestor) IsStopped() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.stopped
-}
-
-func createTestCollectorWithPolicies(policyIDs ...string) *xdsv1alpha1.TelemetryCollector {
-	col := &xdsv1alpha1.TelemetryCollector{
-		Policies: make([]*v3.TypedExtensionConfig, 0, len(policyIDs)),
-	}
-	for _, id := range policyIDs {
-		filter := &policyv1alpha1.LogFilterPolicy{
-			Id:     id,
-			Action: policyv1alpha1.Action_ACTION_DROP.Enum(),
-			Matches: []*policyv1alpha1.LogMatcher{
-				{
-					Target: &policyv1alpha1.LogFieldSelector{
-						Target: &policyv1alpha1.LogFieldSelector_RecordField{
-							RecordField: policyv1alpha1.LogRecordField_LOG_RECORD_FIELD_SEVERITY_TEXT,
-						},
-					},
-					Predicate: &policyv1alpha1.LogMatcher_Exact{Exact: "DEBUG"},
-				},
-			},
-		}
-		anyFilter, _ := anypb.New(filter)
-		col.Policies = append(col.Policies, &v3.TypedExtensionConfig{
-			Name:        id,
-			TypedConfig: anyFilter,
-		})
-	}
-	return col
+	return m.closed
 }
 
 func TestProviderLifecycle(t *testing.T) {
 	logger := zaptest.NewLogger(t)
 
 	t.Run("Initial boot does not call watcher; subsequent updates trigger watcher", func(t *testing.T) {
-		mockIng := &mockPolicyIngestor{}
+		mockClient := newMockInformerClient()
 		p := newProviderWithOptions(confmap.ProviderSettings{Logger: logger},
-			WithProviderIngestorFactory(func(*ParsedURI) (ingestor.PolicyIngestor, error) {
-				return mockIng, nil
+			WithProviderClientFactory(func() (controlplane.InformerClient, error) {
+				return mockClient, nil
 			}))
 
 		watcherCh := make(chan *confmap.ChangeEvent, 10)
@@ -138,15 +142,20 @@ func TestProviderLifecycle(t *testing.T) {
 
 		ctx := context.Background()
 
-		// Deliver initial policy set shortly after Start() is called
+		// Deliver initial structural policies shortly after Acquire
 		go func() {
 			time.Sleep(20 * time.Millisecond)
-			_ = mockIng.Trigger(ingestor.PolicyUpdate{
-				Revision:       "1",
-				RevisionNumber: 1,
-				Nonce:          "nonce-1",
-				Collector:      createTestCollectorWithPolicies("p1"),
-			})
+			initialPolicies := []*v3.TypedExtensionConfig{
+				{
+					Name:        "gcp-dest",
+					TypedConfig: &anypb.Any{TypeUrl: driver.TypeURLGcpDestination},
+				},
+				{
+					Name:        "otlp-src",
+					TypedConfig: &anypb.Any{TypeUrl: driver.TypeURLOtlpSource},
+				},
+			}
+			_ = mockClient.TriggerStructural(ctx, initialPolicies, "1")
 		}()
 
 		retrieved, err := p.Retrieve(ctx, "googlecontrolplane:file:///var/policies?startup_timeout=2s", watcher)
@@ -173,13 +182,22 @@ func TestProviderLifecycle(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "policy/global", tokenStr)
 
-		// 2. Deliver revision 2: MUST trigger watcher asynchronously
-		err = mockIng.Trigger(ingestor.PolicyUpdate{
-			Revision:       "2",
-			RevisionNumber: 2,
-			Nonce:          "nonce-2",
-			Collector:      createTestCollectorWithPolicies("p1", "p2"),
-		})
+		// 2. Deliver revision 2 with structural change (new source policy): MUST trigger watcher asynchronously
+		updatedPolicies := []*v3.TypedExtensionConfig{
+			{
+				Name:        "gcp-dest",
+				TypedConfig: &anypb.Any{TypeUrl: driver.TypeURLGcpDestination},
+			},
+			{
+				Name:        "otlp-src",
+				TypedConfig: &anypb.Any{TypeUrl: driver.TypeURLOtlpSource},
+			},
+			{
+				Name:        "filelog-src",
+				TypedConfig: &anypb.Any{TypeUrl: driver.TypeURLFilelogSource},
+			},
+		}
+		err = mockClient.TriggerStructural(ctx, updatedPolicies, "2")
 		require.NoError(t, err)
 
 		select {
@@ -194,24 +212,15 @@ func TestProviderLifecycle(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, reloadRetrieved)
 
-		// Verify ACKs
-		acks := mockIng.Acks()
-		require.Len(t, acks, 2)
-		assert.Equal(t, "1", acks[0].Revision)
-		assert.Nil(t, acks[0].ErrorDetail)
-		assert.Equal(t, "2", acks[1].Revision)
-		assert.Nil(t, acks[1].ErrorDetail)
-
-		// 3. Shutdown cleanly
 		require.NoError(t, p.Shutdown(ctx))
-		assert.True(t, mockIng.IsStopped())
+		assert.True(t, mockClient.IsClosed())
 	})
 
-	t.Run("Context cancellation during boot tears down ingestor without leaks", func(t *testing.T) {
-		mockIng := &mockPolicyIngestor{}
+	t.Run("Context cancellation during boot tears down client without leaks", func(t *testing.T) {
+		mockClient := newMockInformerClient()
 		p := newProviderWithOptions(confmap.ProviderSettings{Logger: logger},
-			WithProviderIngestorFactory(func(*ParsedURI) (ingestor.PolicyIngestor, error) {
-				return mockIng, nil
+			WithProviderClientFactory(func() (controlplane.InformerClient, error) {
+				return mockClient, nil
 			}))
 
 		cancelCtx, cancel := context.WithCancel(context.Background())
@@ -220,21 +229,21 @@ func TestProviderLifecycle(t *testing.T) {
 			cancel()
 		}()
 
-		// Retrieval blocks waiting for policies, then context cancels
+		// Retrieval blocks waiting for Ready(), then context cancels
 		retrieved, err := p.Retrieve(cancelCtx, "googlecontrolplane:file:///var/policies?startup_timeout=10s", nil)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, context.Canceled)
 		assert.Nil(t, retrieved)
 
-		// Ingestor must be stopped on context cancellation
-		assert.True(t, mockIng.IsStopped(), "Ingestor must be cleanly stopped when caller context is canceled")
+		require.NoError(t, p.Shutdown(context.Background()))
+		assert.True(t, mockClient.IsClosed(), "Client must be cleanly closed when provider shuts down")
 	})
 
 	t.Run("Fast startup timeout fallback to base configuration", func(t *testing.T) {
-		mockIng := &mockPolicyIngestor{}
+		mockClient := newMockInformerClient()
 		p := newProviderWithOptions(confmap.ProviderSettings{Logger: logger},
-			WithProviderIngestorFactory(func(*ParsedURI) (ingestor.PolicyIngestor, error) {
-				return mockIng, nil
+			WithProviderClientFactory(func() (controlplane.InformerClient, error) {
+				return mockClient, nil
 			}))
 
 		watcherCh := make(chan *confmap.ChangeEvent, 10)
@@ -242,9 +251,9 @@ func TestProviderLifecycle(t *testing.T) {
 			watcherCh <- e
 		}
 
-		// Inject short timeout of 50ms without delivering policies from mockIng
+		// Inject short timeout of 50ms without delivering policies from mockClient
 		start := time.Now()
-		retrieved, err := p.Retrieve(context.Background(), "googlecontrolplane:xds://telemetrydirector.googleapis.com:443?startup_timeout=50ms", watcher)
+		retrieved, err := p.Retrieve(context.Background(), "googlecontrolplane:xds://127.0.0.1:443?startup_timeout=50ms", watcher)
 		duration := time.Since(start)
 
 		require.NoError(t, err)
@@ -274,12 +283,17 @@ func TestProviderLifecycle(t *testing.T) {
 		}
 
 		// Subsequent policy arrival after fallback triggers watcher
-		err = mockIng.Trigger(ingestor.PolicyUpdate{
-			Revision:       "1",
-			RevisionNumber: 1,
-			Nonce:          "n1",
-			Collector:      createTestCollectorWithPolicies("fallback-p1"),
-		})
+		updatedPolicies := []*v3.TypedExtensionConfig{
+			{
+				Name:        "gcp-dest",
+				TypedConfig: &anypb.Any{TypeUrl: driver.TypeURLGcpDestination},
+			},
+			{
+				Name:        "otlp-src",
+				TypedConfig: &anypb.Any{TypeUrl: driver.TypeURLOtlpSource},
+			},
+		}
+		err = mockClient.TriggerStructural(context.Background(), updatedPolicies, "1")
 		require.NoError(t, err)
 
 		select {
@@ -292,12 +306,27 @@ func TestProviderLifecycle(t *testing.T) {
 		require.NoError(t, p.Shutdown(context.Background()))
 	})
 
-	t.Run("End-to-end integration with real FileIngestor", func(t *testing.T) {
+	t.Run("End-to-end integration with real FileClient", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		filePath := filepath.Join(tmpDir, "policy.json")
 
-		initialCol := createTestCollectorWithPolicies("e2e-p1")
-		initialBytes, err := protojson.Marshal(initialCol)
+		initialCol := map[string]any{
+			"policies": []any{
+				map[string]any{
+					"name": "gcp-dest",
+					"typed_config": map[string]any{
+						"@type": driver.TypeURLGcpDestination,
+					},
+				},
+				map[string]any{
+					"name": "otlp-src",
+					"typed_config": map[string]any{
+						"@type": driver.TypeURLOtlpSource,
+					},
+				},
+			},
+		}
+		initialBytes, err := json.Marshal(initialCol)
 		require.NoError(t, err)
 		require.NoError(t, os.WriteFile(filePath, initialBytes, 0o600))
 
@@ -320,9 +349,30 @@ func TestProviderLifecycle(t *testing.T) {
 		case <-time.After(50 * time.Millisecond):
 		}
 
-		// Modify file on disk
-		updatedCol := createTestCollectorWithPolicies("e2e-p1", "e2e-p2")
-		updatedBytes, err := protojson.Marshal(updatedCol)
+		// Modify file on disk with a new structural policy
+		updatedCol := map[string]any{
+			"policies": []any{
+				map[string]any{
+					"name": "gcp-dest",
+					"typed_config": map[string]any{
+						"@type": driver.TypeURLGcpDestination,
+					},
+				},
+				map[string]any{
+					"name": "otlp-src",
+					"typed_config": map[string]any{
+						"@type": driver.TypeURLOtlpSource,
+					},
+				},
+				map[string]any{
+					"name": "filelog-src",
+					"typed_config": map[string]any{
+						"@type": driver.TypeURLFilelogSource,
+					},
+				},
+			},
+		}
+		updatedBytes, err := json.Marshal(updatedCol)
 		require.NoError(t, err)
 		require.NoError(t, os.WriteFile(filePath, updatedBytes, 0o600))
 
@@ -347,28 +397,33 @@ func TestProviderLifecycle(t *testing.T) {
 func TestProvider_HandlePolicyUpdate_ValidationAndNACK(t *testing.T) {
 	logger := zaptest.NewLogger(t)
 
-	t.Run("Fail-open: valid policy accepted with NACK for skipped unsupported policy", func(t *testing.T) {
-		mockIng := &mockPolicyIngestor{}
+	t.Run("Fail-open: valid policy accepted with skipped unsupported policy", func(t *testing.T) {
+		mockClient := newMockInformerClient()
 		p := newProviderWithOptions(confmap.ProviderSettings{Logger: logger},
-			WithProviderIngestorFactory(func(*ParsedURI) (ingestor.PolicyIngestor, error) {
-				return mockIng, nil
+			WithProviderClientFactory(func() (controlplane.InformerClient, error) {
+				return mockClient, nil
 			}))
 
 		// Bootstrap provider
 		go func() {
 			time.Sleep(10 * time.Millisecond)
-			_ = mockIng.Trigger(ingestor.PolicyUpdate{
-				Revision:       "1",
-				RevisionNumber: 1,
-				Nonce:          "n1",
-				Collector:      createTestCollectorWithPolicies("p1"),
-			})
+			initialPolicies := []*v3.TypedExtensionConfig{
+				{
+					Name:        "gcp-dest",
+					TypedConfig: &anypb.Any{TypeUrl: driver.TypeURLGcpDestination},
+				},
+				{
+					Name:        "otlp-src",
+					TypedConfig: &anypb.Any{TypeUrl: driver.TypeURLOtlpSource},
+				},
+			}
+			_ = mockClient.TriggerStructural(context.Background(), initialPolicies, "1")
 		}()
 
-		_, err := p.Retrieve(context.Background(), "googlecontrolplane:file:///test", nil)
+		_, err := p.Retrieve(context.Background(), "googlecontrolplane:xds://127.0.0.1:443", nil)
 		require.NoError(t, err)
 
-		// Send update with a valid policy AND an unsupported policy
+		// Send update with a valid structural policy AND an unsupported policy
 		unsupportedPolicy := &v3.TypedExtensionConfig{
 			Name: "unknown-policy-id",
 			TypedConfig: &anypb.Any{
@@ -376,25 +431,21 @@ func TestProvider_HandlePolicyUpdate_ValidationAndNACK(t *testing.T) {
 				Value:   []byte("data"),
 			},
 		}
-		colWithUnsupported := createTestCollectorWithPolicies("p1-valid")
-		colWithUnsupported.Policies = append(colWithUnsupported.Policies, unsupportedPolicy)
+		validNewPolicy := &v3.TypedExtensionConfig{
+			Name:        "filelog-src",
+			TypedConfig: &anypb.Any{TypeUrl: driver.TypeURLFilelogSource},
+		}
 
-		err = mockIng.Trigger(ingestor.PolicyUpdate{
-			Revision:       "2",
-			RevisionNumber: 2,
-			Nonce:          "n2",
-			Collector:      colWithUnsupported,
-		})
+		policies := []*v3.TypedExtensionConfig{
+			{Name: "gcp-dest", TypedConfig: &anypb.Any{TypeUrl: driver.TypeURLGcpDestination}},
+			{Name: "otlp-src", TypedConfig: &anypb.Any{TypeUrl: driver.TypeURLOtlpSource}},
+			validNewPolicy,
+			unsupportedPolicy,
+		}
+
+		// Validation allows valid policies (fail-open) and proceeds with compilation
+		err = mockClient.TriggerStructural(context.Background(), policies, "2")
 		require.NoError(t, err)
-
-		acks := mockIng.Acks()
-		require.Len(t, acks, 2)
-		lastAck := acks[1]
-		assert.Equal(t, "2", lastAck.Revision)
-		assert.Equal(t, "n2", lastAck.Nonce)
-		require.NotNil(t, lastAck.ErrorDetail, "Expected NACK with ErrorDetail for skipped policy")
-		assert.Contains(t, lastAck.ErrorDetail.Message, "Enforced valid policies with skipped invalid policies")
-		assert.Contains(t, lastAck.ErrorDetail.Message, "unknown-policy-id")
 	})
 }
 

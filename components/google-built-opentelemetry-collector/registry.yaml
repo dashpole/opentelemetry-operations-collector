@@ -23,6 +23,12 @@ exporters:
     path: "../components/google-built-opentelemetry-collector/exporter/googleservicecontrolexporter"
 
 extensions:
+  googlexdspolicy:
+    gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/extension/googlexdspolicy v0.0.0
+    path: "../components/google-built-opentelemetry-collector/extension/googlexdspolicy"
+  filepolicy:
+    gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/extension/filepolicy v0.0.0
+    path: "../components/google-built-opentelemetry-collector/extension/filepolicy"
   googlecontrolplaneextension:
     gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/extension/googlecontrolplaneextension v0.0.0
     path: "../components/google-built-opentelemetry-collector/extension/googlecontrolplaneextension"

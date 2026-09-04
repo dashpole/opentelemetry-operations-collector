@@ -17,6 +17,7 @@ package googlexdspolicy
 import (
 	"context"
 
+	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/pkg/controlplane"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/extension"
 )
@@ -46,6 +47,18 @@ func NewFactory() extension.Factory {
 		typeStr,
 		createDefaultConfig,
 		createExtension,
+		component.StabilityLevelAlpha,
+	)
+}
+
+// NewFactoryWithRegistry creates a factory for googlexdspolicy extension using a custom InformerRegistry.
+func NewFactoryWithRegistry(reg *controlplane.InformerRegistry) extension.Factory {
+	return extension.NewFactory(
+		typeStr,
+		createDefaultConfig,
+		func(_ context.Context, set extension.Settings, cfg component.Config) (extension.Extension, error) {
+			return newExtension(set, cfg.(*Config)).WithRegistry(reg), nil
+		},
 		component.StabilityLevelAlpha,
 	)
 }

@@ -15,6 +15,7 @@
 package googlecontrolplane
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -23,10 +24,12 @@ import (
 
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/confmap/provider/googlecontrolplane/driver"
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/confmap/provider/googlecontrolplane/ingestor"
+	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/pkg/controlplane"
+	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/pkg/controlplane/file"
+	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/pkg/controlplane/xds"
+	v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	"go.opentelemetry.io/collector/confmap"
 	"go.uber.org/zap"
-	status "google.golang.org/genproto/googleapis/rpc/status"
-	"google.golang.org/grpc/codes"
 )
 
 // DefaultStartupTimeout is the maximum time the provider waits for initial policy receipt from
@@ -34,28 +37,33 @@ import (
 const DefaultStartupTimeout = 15 * time.Second
 
 // Provider implements confmap.Provider for the googlecontrolplane scheme.
-// It manages policy ingestion via file or xDS, validates incoming policies, compiles them into
-// runnable collector configurations, and triggers asynchronous in-process dynamic reloads.
+// It manages policy ingestion via InformerRegistry (xDS or File transports), validates incoming
+// policies, compiles them into runnable collector configurations, and triggers asynchronous
+// in-process dynamic reloads.
 type Provider struct {
-	mu             sync.RWMutex
-	logger         *zap.Logger
-	driverRegistry *driver.PolicyDriverRegistry
-	ingestor       ingestor.PolicyIngestor
-	compiler       *ConfigCompiler
-	validator      *PolicyValidator
-	prevalidator   *PreValidator
-	statusRegistry *StatusRegistry
-	escapeHatch    *EscapeHatchResolver
-	currentConf    map[string]any
-	resolvedTokens map[string]string
-	watcher        confmap.WatcherFunc
-	bootstrapped   bool
-	initialReady   chan struct{}
-	initialOnce    sync.Once
-	initStreamOnce sync.Once
-	cancel         context.CancelFunc
+	mu                       sync.RWMutex
+	logger                   *zap.Logger
+	driverRegistry           *driver.PolicyDriverRegistry
+	registry                 *controlplane.InformerRegistry
+	clientHandle             *controlplane.ClientHandle
+	compiler                 *ConfigCompiler
+	validator                *PolicyValidator
+	prevalidator             *PreValidator
+	escapeHatch              *EscapeHatchResolver
+	currentConf              map[string]any
+	resolvedTokens           map[string]string
+	activeStructuralPolicies []*v3.TypedExtensionConfig
+	watcher                  confmap.WatcherFunc
+	watcherWg                sync.WaitGroup
+	startupTimeout           time.Duration
+	failOnTimeout            bool
+	parsedURI                *ParsedURI
+	initStreamOnce           sync.Once
 
-	// Custom ingestor factory hook for testing
+	customCompiler           bool
+	// Custom client factory hook for testing
+	customClientFactory func() (controlplane.InformerClient, error)
+	// Backward-compatible hook for testing
 	ingestorFactory func(*ParsedURI) (ingestor.PolicyIngestor, error)
 }
 
@@ -72,10 +80,10 @@ func WithProviderDriverRegistry(reg *driver.PolicyDriverRegistry) ProviderOption
 	}
 }
 
-// WithProviderStatusRegistry sets the status registry.
-func WithProviderStatusRegistry(sr *StatusRegistry) ProviderOption {
+// WithProviderInformerRegistry sets the control plane InformerRegistry.
+func WithProviderInformerRegistry(reg *controlplane.InformerRegistry) ProviderOption {
 	return func(p *Provider) {
-		p.statusRegistry = sr
+		p.registry = reg
 	}
 }
 
@@ -83,7 +91,34 @@ func WithProviderStatusRegistry(sr *StatusRegistry) ProviderOption {
 func WithProviderCompiler(c *ConfigCompiler) ProviderOption {
 	return func(p *Provider) {
 		p.compiler = c
+		p.customCompiler = true
 	}
+}
+
+// WithProviderClientFactory injects a custom factory for creating InformerClients (e.g. for testing).
+func WithProviderClientFactory(factory func() (controlplane.InformerClient, error)) ProviderOption {
+	return func(p *Provider) {
+		p.customClientFactory = factory
+	}
+}
+
+// WithProviderStartupTimeout sets the default startup timeout.
+func WithProviderStartupTimeout(timeout time.Duration) ProviderOption {
+	return func(p *Provider) {
+		p.startupTimeout = timeout
+	}
+}
+
+// WithProviderFailOnTimeout sets whether timeout during boot causes an error instead of fallback.
+func WithProviderFailOnTimeout(fail bool) ProviderOption {
+	return func(p *Provider) {
+		p.failOnTimeout = fail
+	}
+}
+
+// WithProviderStatusRegistry is retained for backwards compatibility.
+func WithProviderStatusRegistry(sr *StatusRegistry) ProviderOption {
+	return func(p *Provider) {}
 }
 
 // WithProviderIngestorFactory injects a custom factory for creating policy ingestors (e.g. for testing).
@@ -122,10 +157,10 @@ func newProviderWithOptions(settings confmap.ProviderSettings, opts ...ProviderO
 		validator:      NewPolicyValidator(reg, logger),
 		compiler:       NewConfigCompiler(reg, logger),
 		prevalidator:   NewPreValidator(reg, logger),
-		statusRegistry: DefaultStatusRegistry,
 		escapeHatch:    NewEscapeHatchResolver(),
 		resolvedTokens: make(map[string]string),
-		initialReady:   make(chan struct{}),
+		startupTimeout: DefaultStartupTimeout,
+		registry:       controlplane.DefaultRegistry,
 	}
 
 	for _, opt := range opts {
@@ -144,35 +179,102 @@ func (p *Provider) Scheme() string {
 // It handles component token queries (e.g. component//global_policy_processor) and root
 // control plane URIs (xds:// or file://).
 func (p *Provider) Retrieve(ctx context.Context, uri string, watcher confmap.WatcherFunc) (*confmap.Retrieved, error) {
+	clean := strings.TrimPrefix(uri, "googlecontrolplane:")
+	clean = strings.TrimPrefix(clean, "//")
+	if strings.HasPrefix(clean, "component//") || strings.HasPrefix(clean, "component:/") || strings.HasPrefix(clean, "component/") {
+		p.mu.RLock()
+		clientHandle := p.clientHandle
+		p.mu.RUnlock()
+		if clientHandle == nil {
+			return nil, fmt.Errorf("component anchor %q cannot be resolved before root provider URI is retrieved; ensure googlecontrolplane root config precedes base config in --config arguments", uri)
+		}
+
+		token := p.extractComponentToken(uri)
+		resolvedID, err := p.resolveComponentAnchor(ctx, token)
+		if err != nil {
+			return nil, err
+		}
+		return confmap.NewRetrieved(resolvedID)
+	}
+
+	return p.retrieveRootConfiguration(ctx, uri, watcher)
+}
+
+func (p *Provider) extractComponentToken(uri string) string {
+	cleanURI := strings.TrimPrefix(uri, "googlecontrolplane:")
+	cleanURI = strings.TrimPrefix(cleanURI, "//")
+	if strings.HasPrefix(cleanURI, "component//") {
+		return strings.TrimPrefix(cleanURI, "component//")
+	}
+	if strings.HasPrefix(cleanURI, "component:/") {
+		return strings.TrimPrefix(cleanURI, "component:/")
+	}
+	if strings.HasPrefix(cleanURI, "component/") {
+		return strings.TrimPrefix(cleanURI, "component/")
+	}
+	return strings.TrimPrefix(cleanURI, "/")
+}
+
+func (p *Provider) resolveComponentAnchor(ctx context.Context, token string) (string, error) {
+	p.mu.RLock()
+	handle := p.clientHandle
+	hasConf := p.currentConf != nil
+	startupTimeout := p.startupTimeout
+	if startupTimeout <= 0 {
+		startupTimeout = DefaultStartupTimeout
+	}
+	p.mu.RUnlock()
+
+	if handle == nil {
+		return "", fmt.Errorf("component anchor %q cannot be resolved before root provider URI is retrieved; ensure googlecontrolplane root config precedes base config in --config arguments", token)
+	}
+
+	if !hasConf {
+		// Synchronize on handle.Informer.Ready() if root config has not yet finished bootstrapping
+		select {
+		case <-handle.Informer.Ready():
+		case <-time.After(startupTimeout):
+			return "", fmt.Errorf("timed out waiting for informer readiness while resolving component anchor %q", token)
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	switch token {
+	case "global_policy_processor":
+		return "policy/global", nil
+	case "active_destination_exporter":
+		if exp, ok := p.resolvedTokens["active_destination_exporter"]; ok && exp != "" {
+			return exp, nil
+		}
+		if p.currentConf != nil {
+			if exps, ok := p.currentConf["exporters"].(map[string]any); ok {
+				for expName := range exps {
+					if strings.Contains(expName, "gcp") || strings.Contains(expName, "googlecloud") {
+						return expName, nil
+					}
+				}
+			}
+		}
+		return "", fmt.Errorf("component anchor %q cannot be resolved: no active GCP destination exporter defined in control plane policy", token)
+	default:
+		if val, ok := p.resolvedTokens[token]; ok && val != "" {
+			return val, nil
+		}
+		return "", fmt.Errorf("unknown component token: %q", token)
+	}
+}
+
+func (p *Provider) retrieveRootConfiguration(ctx context.Context, uri string, watcher confmap.WatcherFunc) (*confmap.Retrieved, error) {
 	if watcher != nil {
 		p.mu.Lock()
 		p.watcher = watcher
 		p.mu.Unlock()
 	}
 
-	// Delegate component token resolution to EscapeHatchResolver
-	if p.escapeHatch != nil {
-		if retrieved, isToken, err := p.escapeHatch.ResolveURI(uri); isToken {
-			return retrieved, err
-		}
-	}
-
-	return p.retrieveRootConfiguration(ctx, uri)
-}
-
-func (p *Provider) resolveComponentToken(token string) (*confmap.Retrieved, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	token = strings.TrimPrefix(token, "/")
-	name, ok := p.resolvedTokens[token]
-	if !ok {
-		return nil, fmt.Errorf("unknown component token: %q", token)
-	}
-	return confmap.NewRetrieved(name)
-}
-
-func (p *Provider) retrieveRootConfiguration(ctx context.Context, uri string) (*confmap.Retrieved, error) {
 	p.mu.RLock()
 	conf := p.currentConf
 	p.mu.RUnlock()
@@ -191,16 +293,42 @@ func (p *Provider) retrieveRootConfiguration(ctx context.Context, uri string) (*
 
 	var startErr error
 	p.initStreamOnce.Do(func() {
-		streamCtx, cancel := context.WithCancel(context.Background())
-
-		ing, err := p.createIngestor(parsed)
-		if err != nil {
-			startErr = fmt.Errorf("failed to create policy ingestor: %w", err)
-			cancel()
-			return
+		p.mu.Lock()
+		p.parsedURI = parsed
+		timeout := parsed.StartupTimeout
+		if timeout <= 0 {
+			timeout = p.startupTimeout
+		}
+		if timeout <= 0 {
+			timeout = DefaultStartupTimeout
+		}
+		p.startupTimeout = timeout
+		if parsed.FailOnStartupTimeout {
+			p.failOnTimeout = true
 		}
 
-		if parsed.BaseConfigURI != "" && p.compiler != nil {
+		insecure := parsed.Insecure || ((strings.HasPrefix(parsed.Endpoint, "127.0.0.1:") || strings.HasPrefix(parsed.Endpoint, "localhost:")) && parsed.CACertPath == "" && parsed.ClientCertPath == "")
+
+		if !p.customCompiler {
+			identity := NewIdentityResolver(parsed.FleetID)
+			collectorID, _ := identity.ResolveID()
+			opts := []CompilerOption{
+				WithCompilerTransport(string(parsed.Transport)),
+				WithCompilerFleetID(parsed.FleetID),
+				WithCompilerCollectorID(collectorID),
+				WithCompilerProjectID(parsed.Project),
+				WithCompilerEndpoint(parsed.Endpoint),
+				WithCompilerPath(parsed.Path),
+				WithCompilerInsecure(insecure),
+				WithCompilerServerAuthority(parsed.ServerAuthority),
+				WithCompilerCACertPath(parsed.CACertPath),
+				WithCompilerClientCertPath(parsed.ClientCertPath),
+				WithCompilerClientKeyPath(parsed.ClientKeyPath),
+			}
+			p.compiler = NewConfigCompiler(p.driverRegistry, p.logger, opts...)
+		}
+
+		if parsed.BaseConfigURI != "" {
 			if baseConf, err := p.compiler.LoadBaseConfig(parsed.BaseConfigURI); err == nil {
 				p.compiler.SetBaseConfig(baseConf)
 			} else {
@@ -208,126 +336,195 @@ func (p *Provider) retrieveRootConfiguration(ctx context.Context, uri string) (*
 			}
 		}
 
-		p.mu.Lock()
-		p.cancel = cancel
-		p.ingestor = ing
-		p.mu.Unlock()
-
-		// Start background ingestion
-		if err := ing.Start(streamCtx, p.handlePolicyUpdate); err != nil {
-			startErr = fmt.Errorf("failed to start policy ingestor: %w", err)
-			cancel()
-			p.mu.Lock()
-			p.cancel = nil
-			p.ingestor = nil
-			p.mu.Unlock()
-			_ = ing.Stop(context.Background())
+		reg := p.registry
+		if reg == nil {
+			reg = controlplane.DefaultRegistry
+			p.registry = reg
 		}
+
+		var key string
+		var factory func() (controlplane.InformerClient, error)
+		if p.customClientFactory != nil {
+			key = uri
+			factory = p.customClientFactory
+		} else if parsed.Transport == TransportFile {
+			key, err = controlplane.CanonicalFileKey(parsed.Path)
+			if err != nil {
+				startErr = fmt.Errorf("invalid file path: %w", err)
+				p.mu.Unlock()
+				return
+			}
+			factory = func() (controlplane.InformerClient, error) {
+				return file.NewClient(file.Config{
+					Path:   parsed.Path,
+					Logger: p.logger,
+				})
+			}
+		} else {
+			key = controlplane.CanonicalXdsKey(
+				parsed.Endpoint,
+				parsed.FleetID,
+				parsed.Project,
+				parsed.ServerAuthority,
+				parsed.CACertPath,
+				parsed.ClientCertPath,
+				parsed.ClientKeyPath,
+				insecure,
+			)
+			identity := NewIdentityResolver(parsed.FleetID)
+			collectorID, _ := identity.ResolveID()
+			supportedURLs := p.driverRegistry.SupportedTypeURLs()
+			factory = func() (controlplane.InformerClient, error) {
+				return xds.NewClient(xds.Config{
+					Endpoint:          parsed.Endpoint,
+					CollectorID:       collectorID,
+					FleetID:           parsed.FleetID,
+					Project:           parsed.Project,
+					ServerAuthority:   parsed.ServerAuthority,
+					CACertPath:        parsed.CACertPath,
+					ClientCertPath:    parsed.ClientCertPath,
+					ClientKeyPath:     parsed.ClientKeyPath,
+					Insecure:          insecure,
+					SupportedTypeURLs: supportedURLs,
+					Logger:            p.logger,
+				})
+			}
+		}
+
+		handle, err := reg.Acquire(key, factory)
+		if err != nil {
+			startErr = fmt.Errorf("failed to acquire informer client: %w", err)
+			p.mu.Unlock()
+			return
+		}
+		p.clientHandle = handle
+		handle.RegisterStructuralHandler(p.handleStructuralUpdate)
+		p.mu.Unlock()
 	})
 
 	if startErr != nil {
-		p.logger.Warn("Failed to start policy ingestor, falling back to base configuration", zap.Error(startErr))
-		return p.fallbackToBaseConfiguration(parsed.BaseConfigURI)
+		p.logger.Warn("Failed to acquire informer client, falling back to bootstrap configuration", zap.Error(startErr))
+		return p.fallbackToBootstrap(parsed.BaseConfigURI)
 	}
 
-	timeout := parsed.StartupTimeout
-	if timeout <= 0 {
-		timeout = DefaultStartupTimeout
+	p.mu.RLock()
+	handle := p.clientHandle
+	timeout := p.startupTimeout
+	failOnTimeout := p.failOnTimeout
+	p.mu.RUnlock()
+
+	if handle == nil {
+		return p.fallbackToBootstrap(parsed.BaseConfigURI)
 	}
 
 	select {
-	case <-p.initialReady:
-		p.mu.Lock()
-		p.bootstrapped = true
+	case <-handle.Informer.Ready():
+		p.mu.RLock()
 		conf := p.currentConf
+		p.mu.RUnlock()
+		if conf != nil {
+			return confmap.NewRetrieved(conf)
+		}
+
+		p.mu.Lock()
+		if p.currentConf == nil {
+			bootstrapConf, tokens, _ := p.compiler.Compile(nil)
+			p.currentConf = bootstrapConf
+			p.resolvedTokens = tokens
+			if p.escapeHatch != nil {
+				p.escapeHatch.UpdateTokens(tokens)
+			}
+		}
+		conf = p.currentConf
 		p.mu.Unlock()
 		return confmap.NewRetrieved(conf)
 
 	case <-time.After(timeout):
-		p.logger.Warn("Timed out waiting for initial policy set from control plane; falling back to base configuration",
+		if failOnTimeout {
+			return nil, fmt.Errorf("timed out waiting for initial policy set from control plane")
+		}
+		p.logger.Warn("Provider timed out waiting for initial policy set from control plane; falling back to bootstrap configuration",
 			zap.Duration("timeout", timeout))
-		return p.fallbackToBaseConfiguration(parsed.BaseConfigURI)
+		return p.fallbackToBootstrap(parsed.BaseConfigURI)
 
 	case <-ctx.Done():
-		// Caller context canceled (e.g. shutdown, SIGTERM during boot)
-		p.mu.Lock()
-		cancel := p.cancel
-		p.cancel = nil
-		ing := p.ingestor
-		p.ingestor = nil
-		p.mu.Unlock()
-
-		if cancel != nil {
-			cancel()
-		}
-		if ing != nil {
-			_ = ing.Stop(context.Background())
-		}
 		return nil, ctx.Err()
 	}
 }
 
-func (p *Provider) createIngestor(parsed *ParsedURI) (ingestor.PolicyIngestor, error) {
-	if p.ingestorFactory != nil {
-		return p.ingestorFactory(parsed)
-	}
-
-	switch parsed.Transport {
-	case TransportFile:
-		return ingestor.NewFileIngestor(parsed.Path, p.logger), nil
-
-	case TransportXDS:
-		identity := NewIdentityResolver(parsed.FleetID)
-		collectorID, _ := identity.ResolveID()
-
-		// Configure compiler context
-		p.compiler = NewConfigCompiler(p.driverRegistry, p.logger,
-			WithCompilerFleetID(parsed.FleetID),
-			WithCompilerCollectorID(collectorID))
-
-		supportedURLs := p.driverRegistry.SupportedTypeURLs()
-		return ingestor.NewXdsIngestor(ingestor.XdsIngestorConfig{
-			Endpoint:          parsed.Endpoint,
-			CollectorID:       collectorID,
-			FleetID:           parsed.FleetID,
-			Project:           parsed.Project,
-			SupportedTypeURLs: supportedURLs,
-			Logger:            p.logger,
-		}), nil
-
-	default:
-		return nil, fmt.Errorf("unsupported transport: %s", parsed.Transport)
-	}
-}
-
-func (p *Provider) fallbackToBaseConfiguration(baseURI string) (*confmap.Retrieved, error) {
-	baseConf, err := p.compiler.LoadBaseConfig(baseURI)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load fallback base configuration: %w", err)
-	}
-
+func (p *Provider) fallbackToBootstrap(baseURI string) (*confmap.Retrieved, error) {
 	p.mu.Lock()
-	p.currentConf = baseConf
-	p.resolvedTokens = map[string]string{
-		"global_policy_processor":     "policy/global",
-		"active_destination_exporter": "otlp/gcp_destination",
+	defer p.mu.Unlock()
+
+	if p.currentConf != nil {
+		return confmap.NewRetrieved(p.currentConf)
 	}
+
+	if baseURI != "" && p.compiler != nil {
+		if baseConf, err := p.compiler.LoadBaseConfig(baseURI); err == nil {
+			p.currentConf = baseConf
+			p.resolvedTokens = map[string]string{
+				"global_policy_processor":     "policy/global",
+				"active_destination_exporter": "otlp/gcp_destination",
+			}
+			if p.escapeHatch != nil {
+				p.escapeHatch.UpdateTokens(p.resolvedTokens)
+			}
+			return confmap.NewRetrieved(baseConf)
+		}
+	}
+
+	bootstrapConf, tokens, err := p.compiler.Compile(nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compile fallback bootstrap configuration: %w", err)
+	}
+	p.currentConf = bootstrapConf
+	p.resolvedTokens = tokens
 	if p.escapeHatch != nil {
-		p.escapeHatch.UpdateTokens(p.resolvedTokens)
+		p.escapeHatch.UpdateTokens(tokens)
 	}
-	p.bootstrapped = true
-	p.mu.Unlock()
-
-	p.initialOnce.Do(func() {
-		close(p.initialReady)
-	})
-
-	return confmap.NewRetrieved(baseConf)
+	return confmap.NewRetrieved(bootstrapConf)
 }
 
-func (p *Provider) handlePolicyUpdate(update ingestor.PolicyUpdate) error {
+func (p *Provider) handleStructuralUpdate(ctx context.Context, update controlplane.PolicySnapshotUpdate) error {
+	p.mu.RLock()
+	isColdStartup := p.currentConf == nil
+	activeStructural := p.activeStructuralPolicies
+	p.mu.RUnlock()
+
+	// Dynamic reload path: check if structural policies differ from active
+	if !isColdStartup {
+		newStructural := extractStructuralPolicies(update.Policies)
+		if !hasStructuralDifferences(activeStructural, newStructural) {
+			// No structural changes exist (e.g. filter-only updates or identical topology);
+			// validate to populate statuses, then return nil so
+			// filter policies will be diffed and streamed to informers directly.
+			if update.Statuses != nil {
+				validationResult := p.validator.ValidatePolicies(update.Policies)
+				for k, v := range validationResult.PolicyStatuses {
+					update.Statuses[k] = controlplane.PolicyStatusRecord{
+						PolicyID: k,
+						TypeURL:  v.TypeURL,
+						Status:   toControlPlaneStatus(v.Status),
+					}
+				}
+			}
+			return nil
+		}
+	}
+
+	// Structural changes exist or cold startup:
 	// Layer 1: Policy Ingestion Validation (Fail-Open)
-	validationResult := p.validator.Validate(update.Collector)
+	validationResult := p.validator.ValidatePolicies(update.Policies)
+	if update.Statuses != nil {
+		for k, v := range validationResult.PolicyStatuses {
+			update.Statuses[k] = controlplane.PolicyStatusRecord{
+				PolicyID: k,
+				TypeURL:  v.TypeURL,
+				Status:   toControlPlaneStatus(v.Status),
+			}
+		}
+	}
 	for _, diag := range validationResult.Diagnostics {
 		p.logger.Warn("Policy diagnostic emitted",
 			zap.String("policy_id", diag.PolicyID),
@@ -335,42 +532,18 @@ func (p *Provider) handlePolicyUpdate(update ingestor.PolicyUpdate) error {
 			zap.String("reason", diag.Reason))
 	}
 
-	// Compile remaining valid policies
+	// Compile candidate configuration
 	newConf, newTokens, err := p.compiler.Compile(validationResult.ValidPolicies)
 	if err != nil {
 		p.logger.Error("Failed to compile valid policies", zap.Error(err))
-		p.mu.RLock()
-		ing := p.ingestor
-		p.mu.RUnlock()
-		if ing != nil {
-			_ = ing.Acknowledge(context.Background(), ingestor.PolicyAck{
-				Revision: update.Revision,
-				Nonce:    update.Nonce,
-				ErrorDetail: &status.Status{
-					Code:    int32(codes.InvalidArgument),
-					Message: fmt.Sprintf("Compilation failed: %v", err),
-				},
-			})
-		}
+		p.recordStatusFailed(validationResult, err)
 		return err
 	}
 
 	// Layer 2: PreValidator Runtime Gate (Crash-Proof)
 	if err := p.prevalidator.Validate(newConf); err != nil {
 		p.logger.Error("PreValidator rejected synthesized configuration; reload aborted to prevent process crash", zap.Error(err))
-		p.mu.RLock()
-		ing := p.ingestor
-		p.mu.RUnlock()
-		if ing != nil {
-			_ = ing.Acknowledge(context.Background(), ingestor.PolicyAck{
-				Revision: update.Revision,
-				Nonce:    update.Nonce,
-				ErrorDetail: &status.Status{
-					Code:    int32(codes.InvalidArgument),
-					Message: fmt.Sprintf("Structural validation failed: %v", err),
-				},
-			})
-		}
+		p.recordStatusFailed(validationResult, err)
 		return err
 	}
 
@@ -378,68 +551,113 @@ func (p *Provider) handlePolicyUpdate(update ingestor.PolicyUpdate) error {
 	p.mu.Lock()
 	p.currentConf = newConf
 	p.resolvedTokens = newTokens
+	p.activeStructuralPolicies = extractStructuralPolicies(validationResult.ValidPolicies)
 	if p.escapeHatch != nil {
 		p.escapeHatch.UpdateTokens(newTokens)
 	}
-	isBootstrapped := p.bootstrapped
 	watcher := p.watcher
-	ing := p.ingestor
 	p.mu.Unlock()
 
-	// Unblock initial boot if waiting
-	p.initialOnce.Do(func() {
-		close(p.initialReady)
-	})
-
-	// Update atomic StatusRegistry
-	if p.statusRegistry != nil {
-		p.statusRegistry.SetRevisionAndStatuses(update.RevisionNumber, validationResult.PolicyStatuses)
-	}
-
-	// Trigger dynamic reload ONLY if already bootstrapped.
-	// Dispatched asynchronously so slow reload cycles never block transport ingestors.
-	if isBootstrapped && watcher != nil {
+	// Dynamic reload: trigger in-process collector reload asynchronously
+	if !isColdStartup && watcher != nil {
 		p.logger.Info("Triggering in-process collector reload with updated configuration")
-		go watcher(&confmap.ChangeEvent{})
-	}
-
-	// Send acknowledgment to control plane
-	if ing != nil {
-		if validationResult.HasSkippedPolicies {
-			_ = ing.Acknowledge(context.Background(), ingestor.PolicyAck{
-				Revision: update.Revision,
-				Nonce:    update.Nonce,
-				ErrorDetail: &status.Status{
-					Code:    int32(codes.InvalidArgument),
-					Message: fmt.Sprintf("Enforced valid policies with skipped invalid policies: %s", validationResult.SkippedSummary()),
-				},
-			})
-		} else {
-			_ = ing.Acknowledge(context.Background(), ingestor.PolicyAck{
-				Revision: update.Revision,
-				Nonce:    update.Nonce,
-				ErrorDetail: nil, // ACK
-			})
-		}
+		p.watcherWg.Add(1)
+		go func() {
+			defer p.watcherWg.Done()
+			watcher(&confmap.ChangeEvent{})
+		}()
 	}
 
 	return nil
 }
 
+func (p *Provider) recordStatusFailed(validationResult *ValidationResult, err error) {
+	p.mu.RLock()
+	handle := p.clientHandle
+	p.mu.RUnlock()
+	if handle != nil && handle.Status != nil {
+		for _, pol := range validationResult.ValidPolicies {
+			handle.Status.RecordStatus(pol.GetName(), pol.GetTypedConfig().GetTypeUrl(), controlplane.PolicyStatusFailed, err)
+		}
+	}
+}
+
+func extractStructuralPolicies(policies []*v3.TypedExtensionConfig) []*v3.TypedExtensionConfig {
+	var res []*v3.TypedExtensionConfig
+	for _, pol := range policies {
+		if pol != nil && pol.TypedConfig != nil && controlplane.IsStructuralPolicy(pol.TypedConfig.TypeUrl) {
+			res = append(res, pol)
+		}
+	}
+	return res
+}
+
+func hasStructuralDifferences(oldPolicies, newPolicies []*v3.TypedExtensionConfig) bool {
+	if len(oldPolicies) != len(newPolicies) {
+		return true
+	}
+	oldMap := make(map[string]*v3.TypedExtensionConfig, len(oldPolicies))
+	for _, pol := range oldPolicies {
+		if pol != nil {
+			oldMap[pol.GetName()] = pol
+		}
+	}
+	for _, pol := range newPolicies {
+		if pol == nil {
+			continue
+		}
+		oldP, exists := oldMap[pol.GetName()]
+		if !exists {
+			return true
+		}
+		if oldP.TypedConfig == nil || pol.TypedConfig == nil {
+			if oldP.TypedConfig != pol.TypedConfig {
+				return true
+			}
+			continue
+		}
+		if oldP.TypedConfig.TypeUrl != pol.TypedConfig.TypeUrl || !bytes.Equal(oldP.TypedConfig.Value, pol.TypedConfig.Value) {
+			return true
+		}
+	}
+	return false
+}
+
 // Shutdown stops the policy ingestor and releases background streaming resources.
 func (p *Provider) Shutdown(ctx context.Context) error {
 	p.mu.Lock()
-	cancel := p.cancel
-	p.cancel = nil
-	ing := p.ingestor
-	p.ingestor = nil
+	if p.clientHandle != nil {
+		_ = p.clientHandle.Release()
+		p.clientHandle = nil
+	}
+	reg := p.registry
 	p.mu.Unlock()
 
-	if cancel != nil {
-		cancel()
+	done := make(chan struct{})
+	go func() {
+		p.watcherWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	if ing != nil {
-		return ing.Stop(ctx)
+
+	if reg != nil {
+		return reg.Shutdown(ctx)
 	}
-	return nil
+	return controlplane.DefaultRegistry.Shutdown(ctx)
+}
+
+func toControlPlaneStatus(status string) controlplane.PolicyStatus {
+	switch status {
+	case "accepted":
+		return controlplane.PolicyStatusApplied
+	case "rejected", "unsupported":
+		return controlplane.PolicyStatusFailed
+	default:
+		return controlplane.PolicyStatusPending
+	}
 }

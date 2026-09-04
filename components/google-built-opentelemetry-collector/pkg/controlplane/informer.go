@@ -74,6 +74,7 @@ type PolicySnapshotUpdate struct {
 	RevisionNumber int64
 	Nonce          string
 	Policies       []*v3.TypedExtensionConfig
+	Statuses       map[string]PolicyStatusRecord
 }
 
 // StructuralUpdateHandler is invoked by transport engines when full policy snapshots arrive,
@@ -368,6 +369,8 @@ func (b *PolicyBroadcaster) Close() {
 // IsStructuralPolicy returns true if the typeURL corresponds to a structural pipeline policy
 // (e.g. destination exporter or source receiver) that requires collector reload.
 func IsStructuralPolicy(typeURL string) bool {
-	return strings.Contains(typeURL, "GcpDestinationPolicy") ||
-		strings.Contains(typeURL, "OtlpSourcePolicy")
+	return strings.Contains(typeURL, "Destination") ||
+		strings.Contains(typeURL, "Source") ||
+		strings.Contains(typeURL, "destination") ||
+		strings.Contains(typeURL, "source")
 }

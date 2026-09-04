@@ -92,9 +92,11 @@ The Google-Built OpenTelemetry Collector is an open-source, production-ready bui
 | ack | [docs](https://www.github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/extension/ackextension/README.md) |
 | basicauth | [docs](https://www.github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/extension/basicauthextension/README.md) |
 | bearertokenauth | [docs](https://www.github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/extension/bearertokenauthextension/README.md) |
+| filepolicy | [docs](No docs linked for component) |
 | filestorage | [docs](https://www.github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/extension/storage/filestorage/README.md) |
 | googleclientauth | [docs](https://www.github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/extension/googleclientauthextension/README.md) |
 | googlecontrolplaneextension | [docs](No docs linked for component) |
+| googlexdspolicy | [docs](No docs linked for component) |
 | headerssetter | [docs](https://www.github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/extension/headerssetterextension/README.md) |
 | healthagent | [docs](No docs linked for component) |
 | healthcheck | [docs](https://www.github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/extension/healthcheckextension/README.md) |

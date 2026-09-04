@@ -56,9 +56,9 @@ func TestConfigCompiler(t *testing.T) {
 		// Exporters must include otlp/gcp_destination
 		assert.True(t, conf.IsSet("exporters::otlp/gcp_destination"))
 
-		// Extensions must include googleclientauth and googlecontrolplaneextension
+		// Extensions must include googleclientauth and googlexdspolicy
 		assert.True(t, conf.IsSet("extensions::googleclientauth"))
-		assert.True(t, conf.IsSet("extensions::googlecontrolplaneextension"))
+		assert.True(t, conf.IsSet("extensions::googlexdspolicy"))
 
 		// Processors must include policy/global and batch processors
 		assert.True(t, conf.IsSet("processors::policy/global"))
@@ -81,9 +81,9 @@ func TestConfigCompiler(t *testing.T) {
 		assert.Equal(t, "fleet-test-1", attrsMap["gcp.fleet_id"])
 
 		// Service pipelines for all 3 signals
-		assert.True(t, conf.IsSet("service::pipelines::metrics"))
-		assert.True(t, conf.IsSet("service::pipelines::logs"))
-		assert.True(t, conf.IsSet("service::pipelines::traces"))
+		assert.True(t, conf.IsSet("service::pipelines::metrics/googlecontrolplane"))
+		assert.True(t, conf.IsSet("service::pipelines::logs/googlecontrolplane"))
+		assert.True(t, conf.IsSet("service::pipelines::traces/googlecontrolplane"))
 
 		// Verify PreValidator accepts the synthesized configuration!
 		pv := NewPreValidator(reg, logger)
@@ -180,14 +180,16 @@ func TestConfigCompiler(t *testing.T) {
 		subGpp, err := conf.Sub("processors::policy/global")
 		require.NoError(t, err)
 		var policyGlobalCfg struct {
-			Policies []map[string]any `mapstructure:"policies"`
+			InformerExtensions []string         `mapstructure:"informer_extensions"`
+			Policies           []map[string]any `mapstructure:"policies"`
 		}
 		require.NoError(t, subGpp.Unmarshal(&policyGlobalCfg))
 		assert.Len(t, policyGlobalCfg.Policies, 2)
+		assert.Equal(t, []string{"googlexdspolicy"}, policyGlobalCfg.InformerExtensions)
 
 		// Pipelines verification:
 		// Logs pipeline should have receivers [otlp, filelog]
-		subLogs, err := conf.Sub("service::pipelines::logs")
+		subLogs, err := conf.Sub("service::pipelines::logs/googlecontrolplane")
 		require.NoError(t, err)
 		var logsPipe struct {
 			Receivers  []string `mapstructure:"receivers"`
@@ -201,7 +203,7 @@ func TestConfigCompiler(t *testing.T) {
 		assert.Equal(t, []string{"otlp/gcp_destination"}, logsPipe.Exporters)
 
 		// Metrics pipeline should have receivers [otlp, otlp/selfobs_internal]
-		subMetrics, err := conf.Sub("service::pipelines::metrics")
+		subMetrics, err := conf.Sub("service::pipelines::metrics/googlecontrolplane")
 		require.NoError(t, err)
 		var metricsPipe struct {
 			Receivers  []string `mapstructure:"receivers"`
@@ -343,7 +345,22 @@ func TestConfigCompiler(t *testing.T) {
 			WithCompilerBaseConfig(baseConfig),
 		)
 
-		confMap, _, err := compiler.Compile(nil)
+		policies := []*v3.TypedExtensionConfig{
+			{
+				Name: "gcp-dest",
+				TypedConfig: &anypb.Any{
+					TypeUrl: driver.TypeURLGcpDestination,
+				},
+			},
+			{
+				Name: "otlp-src",
+				TypedConfig: &anypb.Any{
+					TypeUrl: driver.TypeURLOtlpSource,
+				},
+			},
+		}
+
+		confMap, _, err := compiler.Compile(policies)
 		require.NoError(t, err)
 
 		conf := confmap.NewFromStringMap(confMap)
@@ -361,7 +378,7 @@ func TestConfigCompiler(t *testing.T) {
 		assert.Equal(t, []string{"custom_filter"}, tracesPipe.Processors)
 
 		// Synthesized policy pipeline logs is unioned alongside base traces pipeline
-		assert.True(t, conf.IsSet("service::pipelines::logs"))
+		assert.True(t, conf.IsSet("service::pipelines::logs/googlecontrolplane"))
 
 		// Check non-empty service.instance.id from baseConfig overrides compiler default
 		rawAttrs := conf.Get("service::telemetry::resource::attributes")

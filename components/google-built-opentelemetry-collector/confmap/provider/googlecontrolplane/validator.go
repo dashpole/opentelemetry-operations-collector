@@ -69,6 +69,11 @@ func NewPolicyValidator(registry *driver.PolicyDriverRegistry, logger *zap.Logge
 	}
 }
 
+// ValidatePolicies executes Layer 1 validation directly on a slice of TypedExtensionConfig policies.
+func (v *PolicyValidator) ValidatePolicies(policies []*v3.TypedExtensionConfig) *ValidationResult {
+	return v.Validate(&xdsv1alpha1.TelemetryCollector{Policies: policies})
+}
+
 // Validate executes Layer 1 Fail-Open policy validation on incoming TelemetryCollector policies.
 // Unsupported TypeURLs and invalid policies are skipped with diagnostics logged/recorded, while
 // valid policies are retained for configuration compilation.

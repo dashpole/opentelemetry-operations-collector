@@ -364,6 +364,7 @@ func (c *Client) ProcessResponse(ctx context.Context, resp *discoveryv3.Discover
 		RevisionNumber: revNum,
 		Nonce:          resp.Nonce,
 		Policies:       allPolicies,
+		Statuses:       make(map[string]controlplane.PolicyStatusRecord, len(allPolicies)),
 	}
 
 	c.mu.RLock()
@@ -432,19 +433,22 @@ func (c *Client) ProcessResponse(ctx context.Context, resp *discoveryv3.Discover
 	c.broadcaster.UpdatePolicies(allPolicies)
 
 	// Atomically update StatusRegistry
-	statuses := make(map[string]controlplane.PolicyStatusRecord, len(allPolicies))
-	for _, p := range allPolicies {
-		if p == nil {
-			continue
-		}
-		typeURL := ""
-		if p.TypedConfig != nil {
-			typeURL = p.TypedConfig.TypeUrl
-		}
-		statuses[p.Name] = controlplane.PolicyStatusRecord{
-			PolicyID: p.Name,
-			TypeURL:  typeURL,
-			Status:   controlplane.PolicyStatusApplied,
+	statuses := update.Statuses
+	if len(statuses) == 0 {
+		statuses = make(map[string]controlplane.PolicyStatusRecord, len(allPolicies))
+		for _, p := range allPolicies {
+			if p == nil {
+				continue
+			}
+			typeURL := ""
+			if p.TypedConfig != nil {
+				typeURL = p.TypedConfig.TypeUrl
+			}
+			statuses[p.Name] = controlplane.PolicyStatusRecord{
+				PolicyID: p.Name,
+				TypeURL:  typeURL,
+				Status:   controlplane.PolicyStatusApplied,
+			}
 		}
 	}
 	c.statusRegistry.SetRevisionAndStatuses(revNum, statuses)
@@ -462,8 +466,7 @@ func (c *Client) sendRequest(req *discoveryv3.DiscoveryRequest) error {
 }
 
 func isStructuralPolicy(typeURL string) bool {
-	return strings.Contains(typeURL, "GcpDestinationPolicy") ||
-		strings.Contains(typeURL, "OtlpSourcePolicy")
+	return controlplane.IsStructuralPolicy(typeURL)
 }
 
 // LastAckedVersion returns the last acknowledged version info string.
