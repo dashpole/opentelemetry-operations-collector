@@ -15,13 +15,21 @@
 package policyprocessor
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
+	"time"
 
+	v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 
 	policyv1alpha1 "github.com/GoogleCloudPlatform/opentelemetry-operations-collector/gen/go/policy/v1alpha1"
 )
@@ -37,6 +45,10 @@ const (
 
 // Config defines the configuration for policyprocessor.
 type Config struct {
+	InformerExtensions   []component.ID `mapstructure:"informer_extensions"`
+	StartupTimeout       time.Duration  `mapstructure:"startup_timeout"`
+	FailOnStartupTimeout bool           `mapstructure:"fail_on_startup_timeout"`
+
 	Policies []PolicyConfig `mapstructure:"policies"`
 
 	// Compiled stores parsed and validated protobuf messages bound with Policy IDs.
@@ -96,10 +108,19 @@ var _ confmap.Validator = (*Config)(nil)
 // Unmarshal implements confmap.Unmarshaler to parse policy configurations forward-compatibly.
 func (cfg *Config) Unmarshal(conf *confmap.Conf) error {
 	type rawConfig Config
-	var raw rawConfig
+	raw := rawConfig{
+		StartupTimeout:       cfg.StartupTimeout,
+		FailOnStartupTimeout: cfg.FailOnStartupTimeout,
+	}
+	if raw.StartupTimeout == 0 {
+		raw.StartupTimeout = 5 * time.Second
+	}
 	if err := conf.Unmarshal(&raw); err != nil {
 		return err
 	}
+	cfg.InformerExtensions = raw.InformerExtensions
+	cfg.StartupTimeout = raw.StartupTimeout
+	cfg.FailOnStartupTimeout = raw.FailOnStartupTimeout
 	cfg.Policies = raw.Policies
 
 	return cfg.Compile()
@@ -107,205 +128,355 @@ func (cfg *Config) Unmarshal(conf *confmap.Conf) error {
 
 // Validate implements confmap.Validator.
 func (cfg *Config) Validate() error {
+	if cfg.StartupTimeout < 0 {
+		return fmt.Errorf("startup_timeout must be non-negative, got %v", cfg.StartupTimeout)
+	}
 	return cfg.Compile()
 }
 
 // Compile compiles and strictly validates all policy configurations.
 func (cfg *Config) Compile() error {
-	cfg.Compiled = CompiledPolicies{}
+	compiled, err := CompilePolicies(cfg.Policies)
+	if err != nil {
+		return err
+	}
+	cfg.Compiled = *compiled
+	return nil
+}
+
+// CompilePolicies compiles a list of PolicyConfig entries into CompiledPolicies.
+func CompilePolicies(policies []PolicyConfig) (*CompiledPolicies, error) {
+	compiled := &CompiledPolicies{}
+	for i, p := range policies {
+		if err := compilePolicyConfig(i, p, compiled); err != nil {
+			return nil, err
+		}
+	}
+	return compiled, nil
+}
+
+func compilePolicyConfig(i int, p PolicyConfig, compiled *CompiledPolicies) error {
+	if p.Rule == nil {
+		return fmt.Errorf("policy %q (index %d): rule must not be nil", p.ID, i)
+	}
+
+	ruleJSON, err := json.Marshal(p.Rule)
+	if err != nil {
+		return fmt.Errorf("policy %q (index %d): failed to marshal policy rule to JSON: %w", p.ID, i, err)
+	}
 
 	unmarshalOpts := protojson.UnmarshalOptions{
 		DiscardUnknown: true, // Forward-compatible fail-open for unrecognized fields
 	}
 
-	for i, p := range cfg.Policies {
-		if p.Rule == nil {
-			return fmt.Errorf("policy %q (index %d): rule must not be nil", p.ID, i)
+	switch p.TypeURL {
+	case TypeURLLogFilterPolicy, ShortTypeURLLogFilterPolicy:
+		var lp policyv1alpha1.LogFilterPolicy
+		if err := unmarshalOpts.Unmarshal(ruleJSON, &lp); err != nil {
+			return fmt.Errorf("policy %q: failed to unmarshal log policy: %w", p.ID, err)
 		}
-
-		ruleJSON, err := json.Marshal(p.Rule)
+		policyID := p.ID
+		if policyID == "" {
+			policyID = lp.GetId()
+		}
+		if policyID == "" {
+			return fmt.Errorf("log policy at index %d: ID must be specified", i)
+		}
+		clp, err := compileLogPolicy(policyID, &lp)
 		if err != nil {
-			return fmt.Errorf("policy %q (index %d): failed to marshal policy rule to JSON: %w", p.ID, i, err)
+			return err
+		}
+		compiled.LogPolicies = append(compiled.LogPolicies, *clp)
+
+	case TypeURLMetricFilterPolicy, ShortTypeURLMetricFilterPolicy:
+		var mp policyv1alpha1.MetricFilterPolicy
+		if err := unmarshalOpts.Unmarshal(ruleJSON, &mp); err != nil {
+			return fmt.Errorf("policy %q: failed to unmarshal metric policy: %w", p.ID, err)
+		}
+		policyID := p.ID
+		if policyID == "" {
+			policyID = mp.GetId()
+		}
+		if policyID == "" {
+			return fmt.Errorf("metric policy at index %d: ID must be specified", i)
+		}
+		cmp, err := compileMetricPolicy(policyID, &mp)
+		if err != nil {
+			return err
+		}
+		compiled.MetricPolicies = append(compiled.MetricPolicies, *cmp)
+		if cmp.IsDataPointLevel {
+			compiled.MetricDataPointPolicies = append(compiled.MetricDataPointPolicies, *cmp)
+		} else {
+			compiled.MetricInstrumentPolicies = append(compiled.MetricInstrumentPolicies, *cmp)
 		}
 
-		switch p.TypeURL {
-		case TypeURLLogFilterPolicy, ShortTypeURLLogFilterPolicy:
-			var lp policyv1alpha1.LogFilterPolicy
-			if err := unmarshalOpts.Unmarshal(ruleJSON, &lp); err != nil {
-				return fmt.Errorf("policy %q: failed to unmarshal log policy: %w", p.ID, err)
-			}
-			policyID := p.ID
-			if policyID == "" {
-				policyID = lp.GetId()
-			}
-			if policyID == "" {
-				return fmt.Errorf("log policy at index %d: ID must be specified", i)
-			}
-			if lp.Action == nil || (*lp.Action != policyv1alpha1.Action_ACTION_KEEP && *lp.Action != policyv1alpha1.Action_ACTION_DROP) {
-				return fmt.Errorf("log policy %q: action must be ACTION_KEEP or ACTION_DROP, got %v", policyID, lp.GetAction())
-			}
-			if len(lp.GetMatches()) == 0 {
-				return fmt.Errorf("log policy %q: at least one matcher is required", policyID)
-			}
-
-			compiledMatchers := make([]CompiledLogMatcher, 0, len(lp.GetMatches()))
-			for mIdx, m := range lp.GetMatches() {
-				if m == nil {
-					return fmt.Errorf("log policy %q: matcher at index %d is nil", policyID, mIdx)
-				}
-				if err := validateLogTarget(m.GetTarget()); err != nil {
-					return fmt.Errorf("log policy %q: matcher at index %d: %w", policyID, mIdx, err)
-				}
-				pred, err := NewLogPredicate(m)
-				if err != nil {
-					return fmt.Errorf("log policy %q: matcher at index %d: %w", policyID, mIdx, err)
-				}
-				compiledMatchers = append(compiledMatchers, CompiledLogMatcher{
-					Target:    m.GetTarget(),
-					Predicate: pred,
-				})
-			}
-
-			cfg.Compiled.LogPolicies = append(cfg.Compiled.LogPolicies, CompiledLogPolicy{
-				ID:       policyID,
-				Policy:   &lp,
-				Matchers: compiledMatchers,
-				KeepOption: metric.WithAttributes(
-					attribute.String("signal", "logs"),
-					attribute.String("policy_id", policyID),
-					attribute.String("action", "keep"),
-				),
-				DropOption: metric.WithAttributes(
-					attribute.String("signal", "logs"),
-					attribute.String("policy_id", policyID),
-					attribute.String("action", "drop"),
-				),
-			})
-
-		case TypeURLMetricFilterPolicy, ShortTypeURLMetricFilterPolicy:
-			var mp policyv1alpha1.MetricFilterPolicy
-			if err := unmarshalOpts.Unmarshal(ruleJSON, &mp); err != nil {
-				return fmt.Errorf("policy %q: failed to unmarshal metric policy: %w", p.ID, err)
-			}
-			policyID := p.ID
-			if policyID == "" {
-				policyID = mp.GetId()
-			}
-			if policyID == "" {
-				return fmt.Errorf("metric policy at index %d: ID must be specified", i)
-			}
-			if mp.Action == nil || (*mp.Action != policyv1alpha1.Action_ACTION_KEEP && *mp.Action != policyv1alpha1.Action_ACTION_DROP) {
-				return fmt.Errorf("metric policy %q: action must be ACTION_KEEP or ACTION_DROP, got %v", policyID, mp.GetAction())
-			}
-			if len(mp.GetMatches()) == 0 {
-				return fmt.Errorf("metric policy %q: at least one matcher is required", policyID)
-			}
-
-			var isDataPointLevel bool
-			compiledMatchers := make([]CompiledMetricMatcher, 0, len(mp.GetMatches()))
-			for mIdx, m := range mp.GetMatches() {
-				if m == nil {
-					return fmt.Errorf("metric policy %q: matcher at index %d is nil", policyID, mIdx)
-				}
-				if err := validateMetricTarget(m.GetTarget()); err != nil {
-					return fmt.Errorf("metric policy %q: matcher at index %d: %w", policyID, mIdx, err)
-				}
-				if _, ok := m.GetTarget().GetTarget().(*policyv1alpha1.MetricFieldSelector_DatapointAttribute); ok {
-					isDataPointLevel = true
-				}
-				pred, err := NewMetricPredicate(m)
-				if err != nil {
-					return fmt.Errorf("metric policy %q: matcher at index %d: %w", policyID, mIdx, err)
-				}
-				compiledMatchers = append(compiledMatchers, CompiledMetricMatcher{
-					Target:    m.GetTarget(),
-					Predicate: pred,
-				})
-			}
-
-			compiledMetric := CompiledMetricPolicy{
-				ID:               policyID,
-				Policy:           &mp,
-				Matchers:         compiledMatchers,
-				IsDataPointLevel: isDataPointLevel,
-				KeepOption: metric.WithAttributes(
-					attribute.String("signal", "metrics"),
-					attribute.String("policy_id", policyID),
-					attribute.String("action", "keep"),
-				),
-				DropOption: metric.WithAttributes(
-					attribute.String("signal", "metrics"),
-					attribute.String("policy_id", policyID),
-					attribute.String("action", "drop"),
-				),
-			}
-
-			cfg.Compiled.MetricPolicies = append(cfg.Compiled.MetricPolicies, compiledMetric)
-			if isDataPointLevel {
-				cfg.Compiled.MetricDataPointPolicies = append(cfg.Compiled.MetricDataPointPolicies, compiledMetric)
-			} else {
-				cfg.Compiled.MetricInstrumentPolicies = append(cfg.Compiled.MetricInstrumentPolicies, compiledMetric)
-			}
-
-		case TypeURLTraceFilterPolicy, ShortTypeURLTraceFilterPolicy:
-			var tp policyv1alpha1.TraceFilterPolicy
-			if err := unmarshalOpts.Unmarshal(ruleJSON, &tp); err != nil {
-				return fmt.Errorf("policy %q: failed to unmarshal trace policy: %w", p.ID, err)
-			}
-			policyID := p.ID
-			if policyID == "" {
-				policyID = tp.GetId()
-			}
-			if policyID == "" {
-				return fmt.Errorf("trace policy at index %d: ID must be specified", i)
-			}
-			if tp.Action == nil || (*tp.Action != policyv1alpha1.Action_ACTION_KEEP && *tp.Action != policyv1alpha1.Action_ACTION_DROP) {
-				return fmt.Errorf("trace policy %q: action must be ACTION_KEEP or ACTION_DROP, got %v", policyID, tp.GetAction())
-			}
-			if len(tp.GetMatches()) == 0 {
-				return fmt.Errorf("trace policy %q: at least one matcher is required", policyID)
-			}
-
-			compiledMatchers := make([]CompiledTraceMatcher, 0, len(tp.GetMatches()))
-			for mIdx, m := range tp.GetMatches() {
-				if m == nil {
-					return fmt.Errorf("trace policy %q: matcher at index %d is nil", policyID, mIdx)
-				}
-				if err := validateTraceTarget(m.GetTarget()); err != nil {
-					return fmt.Errorf("trace policy %q: matcher at index %d: %w", policyID, mIdx, err)
-				}
-				pred, err := NewTracePredicate(m)
-				if err != nil {
-					return fmt.Errorf("trace policy %q: matcher at index %d: %w", policyID, mIdx, err)
-				}
-				compiledMatchers = append(compiledMatchers, CompiledTraceMatcher{
-					Target:    m.GetTarget(),
-					Predicate: pred,
-				})
-			}
-
-			cfg.Compiled.TracePolicies = append(cfg.Compiled.TracePolicies, CompiledTracePolicy{
-				ID:       policyID,
-				Policy:   &tp,
-				Matchers: compiledMatchers,
-				KeepOption: metric.WithAttributes(
-					attribute.String("signal", "traces"),
-					attribute.String("policy_id", policyID),
-					attribute.String("action", "keep"),
-				),
-				DropOption: metric.WithAttributes(
-					attribute.String("signal", "traces"),
-					attribute.String("policy_id", policyID),
-					attribute.String("action", "drop"),
-				),
-			})
-
-		default:
-			return fmt.Errorf("unsupported policy type_url %q for policy %q", p.TypeURL, p.ID)
+	case TypeURLTraceFilterPolicy, ShortTypeURLTraceFilterPolicy:
+		var tp policyv1alpha1.TraceFilterPolicy
+		if err := unmarshalOpts.Unmarshal(ruleJSON, &tp); err != nil {
+			return fmt.Errorf("policy %q: failed to unmarshal trace policy: %w", p.ID, err)
 		}
+		policyID := p.ID
+		if policyID == "" {
+			policyID = tp.GetId()
+		}
+		if policyID == "" {
+			return fmt.Errorf("trace policy at index %d: ID must be specified", i)
+		}
+		ctp, err := compileTracePolicy(policyID, &tp)
+		if err != nil {
+			return err
+		}
+		compiled.TracePolicies = append(compiled.TracePolicies, *ctp)
+
+	default:
+		return fmt.Errorf("unsupported policy type_url %q for policy %q", p.TypeURL, p.ID)
 	}
 
 	return nil
+}
+
+func compileLogPolicy(policyID string, lp *policyv1alpha1.LogFilterPolicy) (*CompiledLogPolicy, error) {
+	if policyID == "" {
+		return nil, fmt.Errorf("log policy ID must be specified")
+	}
+	if lp.Action == nil || (*lp.Action != policyv1alpha1.Action_ACTION_KEEP && *lp.Action != policyv1alpha1.Action_ACTION_DROP) {
+		return nil, fmt.Errorf("log policy %q: action must be ACTION_KEEP or ACTION_DROP, got %v", policyID, lp.GetAction())
+	}
+	if len(lp.GetMatches()) == 0 {
+		return nil, fmt.Errorf("log policy %q: at least one matcher is required", policyID)
+	}
+
+	compiledMatchers := make([]CompiledLogMatcher, 0, len(lp.GetMatches()))
+	for mIdx, m := range lp.GetMatches() {
+		if m == nil {
+			return nil, fmt.Errorf("log policy %q: matcher at index %d is nil", policyID, mIdx)
+		}
+		if err := validateLogTarget(m.GetTarget()); err != nil {
+			return nil, fmt.Errorf("log policy %q: matcher at index %d: %w", policyID, mIdx, err)
+		}
+		pred, err := NewLogPredicate(m)
+		if err != nil {
+			return nil, fmt.Errorf("log policy %q: matcher at index %d: %w", policyID, mIdx, err)
+		}
+		compiledMatchers = append(compiledMatchers, CompiledLogMatcher{
+			Target:    m.GetTarget(),
+			Predicate: pred,
+		})
+	}
+
+	return &CompiledLogPolicy{
+		ID:       policyID,
+		Policy:   lp,
+		Matchers: compiledMatchers,
+		KeepOption: metric.WithAttributes(
+			attribute.String("signal", "logs"),
+			attribute.String("policy_id", policyID),
+			attribute.String("action", "keep"),
+		),
+		DropOption: metric.WithAttributes(
+			attribute.String("signal", "logs"),
+			attribute.String("policy_id", policyID),
+			attribute.String("action", "drop"),
+		),
+	}, nil
+}
+
+func compileMetricPolicy(policyID string, mp *policyv1alpha1.MetricFilterPolicy) (*CompiledMetricPolicy, error) {
+	if policyID == "" {
+		return nil, fmt.Errorf("metric policy ID must be specified")
+	}
+	if mp.Action == nil || (*mp.Action != policyv1alpha1.Action_ACTION_KEEP && *mp.Action != policyv1alpha1.Action_ACTION_DROP) {
+		return nil, fmt.Errorf("metric policy %q: action must be ACTION_KEEP or ACTION_DROP, got %v", policyID, mp.GetAction())
+	}
+	if len(mp.GetMatches()) == 0 {
+		return nil, fmt.Errorf("metric policy %q: at least one matcher is required", policyID)
+	}
+
+	var isDataPointLevel bool
+	compiledMatchers := make([]CompiledMetricMatcher, 0, len(mp.GetMatches()))
+	for mIdx, m := range mp.GetMatches() {
+		if m == nil {
+			return nil, fmt.Errorf("metric policy %q: matcher at index %d is nil", policyID, mIdx)
+		}
+		if err := validateMetricTarget(m.GetTarget()); err != nil {
+			return nil, fmt.Errorf("metric policy %q: matcher at index %d: %w", policyID, mIdx, err)
+		}
+		if _, ok := m.GetTarget().GetTarget().(*policyv1alpha1.MetricFieldSelector_DatapointAttribute); ok {
+			isDataPointLevel = true
+		}
+		pred, err := NewMetricPredicate(m)
+		if err != nil {
+			return nil, fmt.Errorf("metric policy %q: matcher at index %d: %w", policyID, mIdx, err)
+		}
+		compiledMatchers = append(compiledMatchers, CompiledMetricMatcher{
+			Target:    m.GetTarget(),
+			Predicate: pred,
+		})
+	}
+
+	return &CompiledMetricPolicy{
+		ID:               policyID,
+		Policy:           mp,
+		Matchers:         compiledMatchers,
+		IsDataPointLevel: isDataPointLevel,
+		KeepOption: metric.WithAttributes(
+			attribute.String("signal", "metrics"),
+			attribute.String("policy_id", policyID),
+			attribute.String("action", "keep"),
+		),
+		DropOption: metric.WithAttributes(
+			attribute.String("signal", "metrics"),
+			attribute.String("policy_id", policyID),
+			attribute.String("action", "drop"),
+		),
+	}, nil
+}
+
+func compileTracePolicy(policyID string, tp *policyv1alpha1.TraceFilterPolicy) (*CompiledTracePolicy, error) {
+	if policyID == "" {
+		return nil, fmt.Errorf("trace policy ID must be specified")
+	}
+	if tp.Action == nil || (*tp.Action != policyv1alpha1.Action_ACTION_KEEP && *tp.Action != policyv1alpha1.Action_ACTION_DROP) {
+		return nil, fmt.Errorf("trace policy %q: action must be ACTION_KEEP or ACTION_DROP, got %v", policyID, tp.GetAction())
+	}
+	if len(tp.GetMatches()) == 0 {
+		return nil, fmt.Errorf("trace policy %q: at least one matcher is required", policyID)
+	}
+
+	compiledMatchers := make([]CompiledTraceMatcher, 0, len(tp.GetMatches()))
+	for mIdx, m := range tp.GetMatches() {
+		if m == nil {
+			return nil, fmt.Errorf("trace policy %q: matcher at index %d is nil", policyID, mIdx)
+		}
+		if err := validateTraceTarget(m.GetTarget()); err != nil {
+			return nil, fmt.Errorf("trace policy %q: matcher at index %d: %w", policyID, mIdx, err)
+		}
+		pred, err := NewTracePredicate(m)
+		if err != nil {
+			return nil, fmt.Errorf("trace policy %q: matcher at index %d: %w", policyID, mIdx, err)
+		}
+		compiledMatchers = append(compiledMatchers, CompiledTraceMatcher{
+			Target:    m.GetTarget(),
+			Predicate: pred,
+		})
+	}
+
+	return &CompiledTracePolicy{
+		ID:       policyID,
+		Policy:   tp,
+		Matchers: compiledMatchers,
+		KeepOption: metric.WithAttributes(
+			attribute.String("signal", "traces"),
+			attribute.String("policy_id", policyID),
+			attribute.String("action", "keep"),
+		),
+		DropOption: metric.WithAttributes(
+			attribute.String("signal", "traces"),
+			attribute.String("policy_id", policyID),
+			attribute.String("action", "drop"),
+		),
+	}, nil
+}
+
+func compileTypedExtensionConfig(pid string, typedCfg *v3.TypedExtensionConfig, compiled *CompiledPolicies) error {
+	if typedCfg == nil || typedCfg.TypedConfig == nil {
+		return fmt.Errorf("policy %q: nil typed config", pid)
+	}
+	typeURL := typedCfg.TypedConfig.TypeUrl
+	if !isFilterPolicy(typeURL) {
+		return nil
+	}
+
+	policyID := pid
+	if policyID == "" {
+		policyID = typedCfg.Name
+	}
+
+	switch {
+	case strings.HasSuffix(typeURL, "LogFilterPolicy"):
+		var lp policyv1alpha1.LogFilterPolicy
+		if err := unmarshalPolicyProto(typedCfg.TypedConfig, &lp); err != nil {
+			return fmt.Errorf("policy %q: failed to unmarshal log policy: %w", policyID, err)
+		}
+		if policyID == "" {
+			policyID = lp.GetId()
+		}
+		clp, err := compileLogPolicy(policyID, &lp)
+		if err != nil {
+			return err
+		}
+		compiled.LogPolicies = append(compiled.LogPolicies, *clp)
+
+	case strings.HasSuffix(typeURL, "MetricFilterPolicy"):
+		var mp policyv1alpha1.MetricFilterPolicy
+		if err := unmarshalPolicyProto(typedCfg.TypedConfig, &mp); err != nil {
+			return fmt.Errorf("policy %q: failed to unmarshal metric policy: %w", policyID, err)
+		}
+		if policyID == "" {
+			policyID = mp.GetId()
+		}
+		cmp, err := compileMetricPolicy(policyID, &mp)
+		if err != nil {
+			return err
+		}
+		compiled.MetricPolicies = append(compiled.MetricPolicies, *cmp)
+		if cmp.IsDataPointLevel {
+			compiled.MetricDataPointPolicies = append(compiled.MetricDataPointPolicies, *cmp)
+		} else {
+			compiled.MetricInstrumentPolicies = append(compiled.MetricInstrumentPolicies, *cmp)
+		}
+
+	case strings.HasSuffix(typeURL, "TraceFilterPolicy"):
+		var tp policyv1alpha1.TraceFilterPolicy
+		if err := unmarshalPolicyProto(typedCfg.TypedConfig, &tp); err != nil {
+			return fmt.Errorf("policy %q: failed to unmarshal trace policy: %w", policyID, err)
+		}
+		if policyID == "" {
+			policyID = tp.GetId()
+		}
+		ctp, err := compileTracePolicy(policyID, &tp)
+		if err != nil {
+			return err
+		}
+		compiled.TracePolicies = append(compiled.TracePolicies, *ctp)
+
+	default:
+		return nil
+	}
+	return nil
+}
+
+func isFilterPolicy(typeURL string) bool {
+	return strings.HasSuffix(typeURL, "LogFilterPolicy") ||
+		strings.HasSuffix(typeURL, "MetricFilterPolicy") ||
+		strings.HasSuffix(typeURL, "TraceFilterPolicy")
+}
+
+func unmarshalPolicyProto(typedConfig *anypb.Any, target proto.Message) error {
+	if typedConfig == nil {
+		return errors.New("typed config is nil")
+	}
+	data := typedConfig.Value
+	if len(data) == 0 {
+		return errors.New("typed config value is empty")
+	}
+	unmarshalOpts := protojson.UnmarshalOptions{
+		DiscardUnknown: true,
+	}
+	trimmed := bytes.TrimSpace(data)
+	if bytes.HasPrefix(trimmed, []byte("{")) || bytes.HasPrefix(trimmed, []byte("[")) {
+		if err := unmarshalOpts.Unmarshal(trimmed, target); err == nil {
+			return nil
+		}
+	}
+	if err := proto.Unmarshal(data, target); err == nil {
+		return nil
+	}
+	if err := unmarshalOpts.Unmarshal(trimmed, target); err == nil {
+		return nil
+	}
+	return fmt.Errorf("failed to unmarshal policy from binary or json proto")
 }
 
 func validateLogTarget(target *policyv1alpha1.LogFieldSelector) error {

@@ -17,6 +17,7 @@ package policyprocessor
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
@@ -38,7 +39,9 @@ func NewFactory() processor.Factory {
 }
 
 func createDefaultConfig() component.Config {
-	return &Config{}
+	return &Config{
+		StartupTimeout: 5 * time.Second,
+	}
 }
 
 func createLogsProcessor(
@@ -65,6 +68,8 @@ func createLogsProcessor(
 		nextConsumer,
 		proc.processLogs,
 		processorhelper.WithCapabilities(consumer.Capabilities{MutatesData: true}),
+		processorhelper.WithStart(proc.Start),
+		processorhelper.WithShutdown(proc.Shutdown),
 	)
 }
 
@@ -92,6 +97,8 @@ func createMetricsProcessor(
 		nextConsumer,
 		proc.processMetrics,
 		processorhelper.WithCapabilities(consumer.Capabilities{MutatesData: true}),
+		processorhelper.WithStart(proc.Start),
+		processorhelper.WithShutdown(proc.Shutdown),
 	)
 }
 
@@ -119,5 +126,7 @@ func createTracesProcessor(
 		nextConsumer,
 		proc.processTraces,
 		processorhelper.WithCapabilities(consumer.Capabilities{MutatesData: true}),
+		processorhelper.WithStart(proc.Start),
+		processorhelper.WithShutdown(proc.Shutdown),
 	)
 }

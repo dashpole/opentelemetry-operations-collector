@@ -17,6 +17,7 @@ package policyprocessor
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -30,7 +31,7 @@ func TestFactory(t *testing.T) {
 	assert.Equal(t, component.MustNewType("policy"), f.Type())
 
 	defaultCfg := f.CreateDefaultConfig()
-	assert.Equal(t, &Config{}, defaultCfg)
+	assert.Equal(t, &Config{StartupTimeout: 5 * time.Second}, defaultCfg)
 
 	validCfg := &Config{
 		Policies: []PolicyConfig{
