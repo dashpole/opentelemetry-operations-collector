@@ -288,7 +288,7 @@ func TestConfigCompiler(t *testing.T) {
 		assert.Equal(t, "coll-merge", attrs["service.instance.id"])
 		assert.Equal(t, "fleet-merge", attrs["gcp.fleet_id"])
 
-		// Verify policy/global inserted directly before batch/custom
+		// Base pipelines are preserved untouched without implicit injection
 		subPipe, err := conf.Sub("service::pipelines::logs")
 		require.NoError(t, err)
 		var pipe struct {
@@ -297,10 +297,10 @@ func TestConfigCompiler(t *testing.T) {
 			Exporters  []string `mapstructure:"exporters"`
 		}
 		require.NoError(t, subPipe.Unmarshal(&pipe))
-		assert.Equal(t, []string{"memory_limiter", "policy/global", "batch/custom"}, pipe.Processors)
+		assert.Equal(t, []string{"memory_limiter", "batch/custom"}, pipe.Processors)
 	})
 
-	t.Run("Base config merge: policy/global appended when batch processor absent", func(t *testing.T) {
+	t.Run("Base config merge: pipeline union and non-empty attribute override", func(t *testing.T) {
 		baseConfig := map[string]any{
 			"receivers": map[string]any{
 				"otlp": map[string]any{
@@ -320,6 +320,13 @@ func TestConfigCompiler(t *testing.T) {
 				},
 			},
 			"service": map[string]any{
+				"telemetry": map[string]any{
+					"resource": map[string]any{
+						"attributes": []any{
+							map[string]any{"name": "service.instance.id", "value": "custom-override-id"},
+						},
+					},
+				},
 				"pipelines": map[string]any{
 					"traces": map[string]any{
 						"receivers":  []any{"otlp"},
@@ -331,6 +338,8 @@ func TestConfigCompiler(t *testing.T) {
 		}
 
 		compiler := NewConfigCompiler(reg, logger,
+			WithCompilerCollectorID("compiler-default-id"),
+			WithCompilerFleetID("compiler-default-fleet"),
 			WithCompilerBaseConfig(baseConfig),
 		)
 
@@ -339,16 +348,32 @@ func TestConfigCompiler(t *testing.T) {
 
 		conf := confmap.NewFromStringMap(confMap)
 
-		// policy/global appended as final processor before exporter
+		// Base pipeline traces is preserved untouched
+		assert.True(t, conf.IsSet("service::pipelines::traces"))
 		subPipe, err := conf.Sub("service::pipelines::traces")
 		require.NoError(t, err)
-		var pipe struct {
+		var tracesPipe struct {
 			Receivers  []string `mapstructure:"receivers"`
 			Processors []string `mapstructure:"processors"`
 			Exporters  []string `mapstructure:"exporters"`
 		}
-		require.NoError(t, subPipe.Unmarshal(&pipe))
-		assert.Equal(t, []string{"custom_filter", "policy/global"}, pipe.Processors)
+		require.NoError(t, subPipe.Unmarshal(&tracesPipe))
+		assert.Equal(t, []string{"custom_filter"}, tracesPipe.Processors)
+
+		// Synthesized policy pipeline logs is unioned alongside base traces pipeline
+		assert.True(t, conf.IsSet("service::pipelines::logs"))
+
+		// Check non-empty service.instance.id from baseConfig overrides compiler default
+		rawAttrs := conf.Get("service::telemetry::resource::attributes")
+		attrsSlice, ok := rawAttrs.([]any)
+		require.True(t, ok)
+		attrs := make(map[string]any)
+		for _, item := range attrsSlice {
+			m := item.(map[string]any)
+			attrs[m["name"].(string)] = m["value"]
+		}
+		assert.Equal(t, "custom-override-id", attrs["service.instance.id"])
+		assert.Equal(t, "compiler-default-fleet", attrs["gcp.fleet_id"])
 	})
 
 	t.Run("Base config merge: deepMergeMap preserves sub-fields on receivers and components", func(t *testing.T) {

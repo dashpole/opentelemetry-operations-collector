@@ -398,7 +398,7 @@ func (c *ConfigCompiler) mergeWithBaseConfig(base map[string]any, synthesized ma
 	}
 
 	var existingAttrs []any
-	existingKeys := make(map[string]struct{})
+	existingNonEmptyKeys := make(map[string]struct{})
 
 	if rawAttrs, ok := baseResource["attributes"]; ok {
 		switch typedAttrs := rawAttrs.(type) {
@@ -407,7 +407,12 @@ func (c *ConfigCompiler) mergeWithBaseConfig(base map[string]any, synthesized ma
 			for _, item := range typedAttrs {
 				if m, ok := item.(map[string]any); ok {
 					if name, ok := m["name"].(string); ok {
-						existingKeys[name] = struct{}{}
+						val := m["value"]
+						if valStr, isStr := val.(string); isStr && strings.TrimSpace(valStr) != "" {
+							existingNonEmptyKeys[name] = struct{}{}
+						} else if val != nil && val != "" {
+							existingNonEmptyKeys[name] = struct{}{}
+						}
 					}
 				}
 			}
@@ -417,27 +422,31 @@ func (c *ConfigCompiler) mergeWithBaseConfig(base map[string]any, synthesized ma
 					"name":  k,
 					"value": v,
 				})
-				existingKeys[k] = struct{}{}
+				if valStr, isStr := v.(string); isStr && strings.TrimSpace(valStr) != "" {
+					existingNonEmptyKeys[k] = struct{}{}
+				} else if v != nil && v != "" {
+					existingNonEmptyKeys[k] = struct{}{}
+				}
 			}
 		}
 	}
 
 	if c.collectorID != "" {
-		if _, exists := existingKeys["service.instance.id"]; !exists {
+		if _, exists := existingNonEmptyKeys["service.instance.id"]; !exists {
 			existingAttrs = append(existingAttrs, map[string]any{
 				"name":  "service.instance.id",
 				"value": c.collectorID,
 			})
-			existingKeys["service.instance.id"] = struct{}{}
+			existingNonEmptyKeys["service.instance.id"] = struct{}{}
 		}
 	}
 	if c.fleetID != "" {
-		if _, exists := existingKeys["gcp.fleet_id"]; !exists {
+		if _, exists := existingNonEmptyKeys["gcp.fleet_id"]; !exists {
 			existingAttrs = append(existingAttrs, map[string]any{
 				"name":  "gcp.fleet_id",
 				"value": c.fleetID,
 			})
-			existingKeys["gcp.fleet_id"] = struct{}{}
+			existingNonEmptyKeys["gcp.fleet_id"] = struct{}{}
 		}
 	}
 
@@ -445,53 +454,27 @@ func (c *ConfigCompiler) mergeWithBaseConfig(base map[string]any, synthesized ma
 		baseResource["attributes"] = existingAttrs
 	}
 
-	// Merge service.pipelines
+	// Merge service.pipelines:
+	// Base configuration pipelines are preserved without implicit modification.
+	// Policies must be explicitly merged into configuration-based pipelines via anchors.
+	// Synthesized policy pipelines are unioned alongside base configuration pipelines.
 	basePipelines, _ := baseService["pipelines"].(map[string]any)
 	if basePipelines == nil {
 		basePipelines = make(map[string]any)
 		baseService["pipelines"] = basePipelines
 	}
 
-	// For all existing pipelines in baseConfig, inject policy/global before batching or append
-	for _, pipeData := range basePipelines {
-		pMap, ok := pipeData.(map[string]any)
-		if !ok {
-			continue
-		}
-
-		procs := toStringSlice(pMap["processors"])
-		// Inject policy/global if not already present
-		if !containsString(procs, "policy/global") {
-			injected := false
-			newProcs := make([]string, 0, len(procs)+1)
-
-			for _, p := range procs {
-				// Inject before first batch or queue processor
-				compType := strings.SplitN(p, "/", 2)[0]
-				if !injected && (compType == "batch" || compType == "queue") {
-					newProcs = append(newProcs, "policy/global")
-					injected = true
-				}
-				newProcs = append(newProcs, p)
-			}
-
-			// Fallback: If no batch or queue processor is present, append before exporters
-			if !injected {
-				newProcs = append(newProcs, "policy/global")
-			}
-
-			procAny := make([]any, len(newProcs))
-			for i, p := range newProcs {
-				procAny[i] = p
-			}
-			pMap["processors"] = procAny
-		}
-	}
-
-	// If base config has no pipelines at all, use synthesized pipelines
-	if len(basePipelines) == 0 && synService != nil {
+	if synService != nil {
 		if synPipes, ok := synService["pipelines"].(map[string]any); ok {
-			baseService["pipelines"] = deepCopyMap(synPipes)
+			for k, v := range synPipes {
+				if _, exists := basePipelines[k]; !exists {
+					if pMap, ok := v.(map[string]any); ok {
+						basePipelines[k] = deepCopyMap(pMap)
+					} else {
+						basePipelines[k] = v
+					}
+				}
+			}
 		}
 	}
 
