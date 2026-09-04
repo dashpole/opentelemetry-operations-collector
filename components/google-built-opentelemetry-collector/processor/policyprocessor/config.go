@@ -138,6 +138,23 @@ func (cfg *Config) Validate() error {
 		}
 		seen[id] = struct{}{}
 	}
+
+	seenStaticIDs := make(map[string]struct{}, len(cfg.Policies))
+	for i, pol := range cfg.Policies {
+		pid := pol.ID
+		if pid == "" && pol.Rule != nil {
+			if rid, ok := pol.Rule["id"].(string); ok {
+				pid = rid
+			}
+		}
+		if pid != "" {
+			if _, exists := seenStaticIDs[pid]; exists {
+				return fmt.Errorf("duplicate static policy ID %q at index %d", pid, i)
+			}
+			seenStaticIDs[pid] = struct{}{}
+		}
+	}
+
 	return cfg.Compile()
 }
 

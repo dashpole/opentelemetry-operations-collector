@@ -946,12 +946,18 @@ func TestPolicyProcessor_ReviewerEdgeCases(t *testing.T) {
 	err = proc.Start(ctx, host)
 	require.NoError(t, err)
 
-	// Emit event with TypeURL: "" but event.Policy.TypedConfig.TypeUrl set
+	// Wait for watch loop subscriber to be registered on broadcaster
+	require.Eventually(t, func() bool {
+		return broadcaster.SubscriberCount() > 0
+	}, 3*time.Second, 10*time.Millisecond)
+
+	// Emit event with TypeURL: "" but event.Policy.TypedConfig.TypeUrl set,
+	// and PolicyID: "" but Policy.Name set!
 	pol := makeLogPolicy("empty-typeurl-rule", policyv1alpha1.Action_ACTION_DROP, "TEST_SEV")
 	broadcaster.Broadcast(controlplane.PolicyWatchEvent{
 		Type:     controlplane.EventAdded,
-		TypeURL:  "", // Empty!
-		PolicyID: "empty-typeurl-rule",
+		TypeURL:  "", // Empty! Tests fallback to TypedConfig.TypeUrl
+		PolicyID: "", // Empty! Tests fallback to Policy.Name
 		Policy:   pol,
 	})
 
@@ -1047,4 +1053,91 @@ func TestPolicyProcessor_ReviewerEdgeCases(t *testing.T) {
 	assert.Equal(t, "empty-typeurl-rule", cs.LogPolicies[0].ID)
 	assert.Equal(t, "distinct-static-rule", cs.LogPolicies[1].ID)
 }
+
+func TestPolicyProcessor_StartupDeadlockAndRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 1. Multiple unready informers with failOnStartupTimeout: false must NOT deadlock
+	unreadyInf1 := controlplane.NewPolicyBroadcaster() // never marked ready
+	unreadyInf2 := controlplane.NewPolicyBroadcaster() // never marked ready
+	id1 := component.MustNewIDWithName("googlexdspolicy", "one")
+	id2 := component.MustNewIDWithName("googlexdspolicy", "two")
+
+	host := newMockHost(map[component.ID]component.Component{
+		id1: &mockInformerExtension{unreadyInf1},
+		id2: &mockInformerExtension{unreadyInf2},
+	})
+
+	cfg := &Config{
+		InformerExtensions:   []component.ID{id1, id2},
+		StartupTimeout:       50 * time.Millisecond,
+		FailOnStartupTimeout: false, // degraded mode
+	}
+	set := processortest.NewNopSettings(processortest.NopType)
+	set.Logger = zap.NewNop()
+
+	proc, err := newPolicyProcessor(set, cfg)
+	require.NoError(t, err)
+
+	startDone := make(chan error, 1)
+	go func() {
+		startDone <- proc.Start(ctx, host)
+	}()
+
+	select {
+	case err := <-startDone:
+		require.NoError(t, err, "Multiple unready informers must not deadlock in fail-open mode")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Deadlock in processor.Start() with multiple unready informers!")
+	}
+	_ = proc.Shutdown(ctx)
+
+	// 2. Failed Start() resets p.started so subsequent Start() retry can succeed
+	missingID := component.MustNewIDWithName("googlexdspolicy", "nonexistent")
+	cfgFail := &Config{
+		InformerExtensions: []component.ID{missingID},
+	}
+	procFail, err := newPolicyProcessor(set, cfgFail)
+	require.NoError(t, err)
+
+	// First start fails because extension is missing
+	err = procFail.Start(ctx, host)
+	require.Error(t, err)
+
+	// Fix host to include missing extension
+	readyInf := controlplane.NewPolicyBroadcaster()
+	readyInf.MarkReady()
+	hostWithFix := newMockHost(map[component.ID]component.Component{
+		missingID: &mockInformerExtension{readyInf},
+	})
+
+	// Subsequent start retry must succeed
+	err = procFail.Start(ctx, hostWithFix)
+	require.NoError(t, err, "Retry after failed Start() must succeed")
+	_ = procFail.Shutdown(ctx)
+
+	// 3. Duplicate static policy IDs rejected in Validate()
+	cfgDupStatic := &Config{
+		Policies: []PolicyConfig{
+			{
+				ID:      "same-id",
+				TypeURL: TypeURLLogFilterPolicy,
+				Rule: map[string]any{
+					"action": "ACTION_KEEP",
+				},
+			},
+			{
+				ID:      "same-id",
+				TypeURL: TypeURLLogFilterPolicy,
+				Rule: map[string]any{
+					"action": "ACTION_DROP",
+				},
+			},
+		},
+	}
+	require.Error(t, cfgDupStatic.Validate())
+	assert.Contains(t, cfgDupStatic.Validate().Error(), "duplicate static policy ID \"same-id\"")
+}
+
 

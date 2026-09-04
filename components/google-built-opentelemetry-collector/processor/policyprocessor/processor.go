@@ -102,10 +102,15 @@ func newPolicyProcessor(set processor.Settings, cfg *Config) (*policyProcessor, 
 }
 
 // Start discovers configured informer extensions, validates readiness, and launches background watch loops.
-func (p *policyProcessor) Start(ctx context.Context, host component.Host) error {
+func (p *policyProcessor) Start(ctx context.Context, host component.Host) (err error) {
 	if !p.started.CompareAndSwap(false, true) {
 		return nil
 	}
+	defer func() {
+		if err != nil {
+			p.started.Store(false)
+		}
+	}()
 
 	if len(p.informerExtensions) == 0 {
 		return nil
@@ -130,14 +135,17 @@ func (p *policyProcessor) Start(ctx context.Context, host component.Host) error 
 	if startupTimeout <= 0 {
 		startupTimeout = 5 * time.Second
 	}
-	startupTimer := time.NewTimer(startupTimeout)
-	defer startupTimer.Stop()
+	deadlineCtx, cancelDeadline := context.WithTimeout(ctx, startupTimeout)
+	defer cancelDeadline()
 
 	for _, id := range p.informerExtensions {
 		informer := informers[id.String()]
 		select {
 		case <-informer.Ready():
-		case <-startupTimer.C:
+		case <-deadlineCtx.Done():
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if p.failOnStartupTimeout {
 				return fmt.Errorf("policy informer %q did not become ready within %v", id, p.startupTimeout)
 			}
@@ -145,8 +153,6 @@ func (p *policyProcessor) Start(ctx context.Context, host component.Host) error 
 				zap.String("informer", id.String()),
 				zap.Duration("timeout", p.startupTimeout),
 			)
-		case <-ctx.Done():
-			return ctx.Err()
 		case <-p.ctx.Done():
 			return p.ctx.Err()
 		}
@@ -275,6 +281,14 @@ func (p *policyProcessor) handleWatchEvent(informerID string, informer controlpl
 			return
 		}
 
+		policyID := event.PolicyID
+		if policyID == "" && event.Policy != nil && event.Policy.Name != "" {
+			policyID = event.Policy.Name
+		}
+		if policyID == "" {
+			return
+		}
+
 		p.store.mu.Lock()
 		defer p.store.mu.Unlock()
 
@@ -284,19 +298,19 @@ func (p *policyProcessor) handleWatchEvent(informerID string, informer controlpl
 		if p.store.sources[informerID] == nil {
 			p.store.sources[informerID] = make(map[string]*v3.TypedExtensionConfig)
 		}
-		prevPolicy := p.store.sources[informerID][event.PolicyID]
-		p.store.sources[informerID][event.PolicyID] = event.Policy
+		prevPolicy := p.store.sources[informerID][policyID]
+		p.store.sources[informerID][policyID] = event.Policy
 
 		newCompiled, err := p.compileLocked()
 		if err != nil {
 			if prevPolicy == nil {
-				delete(p.store.sources[informerID], event.PolicyID)
+				delete(p.store.sources[informerID], policyID)
 			} else {
-				p.store.sources[informerID][event.PolicyID] = prevPolicy
+				p.store.sources[informerID][policyID] = prevPolicy
 			}
 			p.logger.Error("Failed to compile updated policy; rolling back store and retaining active rules",
 				zap.String("informer", informerID),
-				zap.String("policy_id", event.PolicyID),
+				zap.String("policy_id", policyID),
 				zap.Error(err),
 			)
 			return
@@ -308,26 +322,34 @@ func (p *policyProcessor) handleWatchEvent(informerID string, informer controlpl
 			return
 		}
 
+		policyID := event.PolicyID
+		if policyID == "" && event.Policy != nil && event.Policy.Name != "" {
+			policyID = event.Policy.Name
+		}
+		if policyID == "" {
+			return
+		}
+
 		p.store.mu.Lock()
 		defer p.store.mu.Unlock()
 
 		if p.store.sources == nil || p.store.sources[informerID] == nil {
 			return
 		}
-		prevPolicy, exists := p.store.sources[informerID][event.PolicyID]
+		prevPolicy, exists := p.store.sources[informerID][policyID]
 		if !exists {
 			return
 		}
-		delete(p.store.sources[informerID], event.PolicyID)
+		delete(p.store.sources[informerID], policyID)
 
 		newCompiled, err := p.compileLocked()
 		if err != nil {
 			if prevPolicy != nil {
-				p.store.sources[informerID][event.PolicyID] = prevPolicy
+				p.store.sources[informerID][policyID] = prevPolicy
 			}
 			p.logger.Error("Failed to compile after deleting policy; rolling back store and retaining active rules",
 				zap.String("informer", informerID),
-				zap.String("policy_id", event.PolicyID),
+				zap.String("policy_id", policyID),
 				zap.Error(err),
 			)
 			return
