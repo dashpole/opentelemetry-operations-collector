@@ -131,6 +131,13 @@ func (cfg *Config) Validate() error {
 	if cfg.StartupTimeout < 0 {
 		return fmt.Errorf("startup_timeout must be non-negative, got %v", cfg.StartupTimeout)
 	}
+	seen := make(map[component.ID]struct{}, len(cfg.InformerExtensions))
+	for _, id := range cfg.InformerExtensions {
+		if _, exists := seen[id]; exists {
+			return fmt.Errorf("duplicate informer extension %q specified in informer_extensions", id)
+		}
+		seen[id] = struct{}{}
+	}
 	return cfg.Compile()
 }
 
@@ -448,9 +455,9 @@ func compileTypedExtensionConfig(pid string, typedCfg *v3.TypedExtensionConfig, 
 }
 
 func isFilterPolicy(typeURL string) bool {
-	return strings.HasSuffix(typeURL, "LogFilterPolicy") ||
-		strings.HasSuffix(typeURL, "MetricFilterPolicy") ||
-		strings.HasSuffix(typeURL, "TraceFilterPolicy")
+	return strings.HasSuffix(typeURL, "google.telemetry.policy.v1alpha1.LogFilterPolicy") ||
+		strings.HasSuffix(typeURL, "google.telemetry.policy.v1alpha1.MetricFilterPolicy") ||
+		strings.HasSuffix(typeURL, "google.telemetry.policy.v1alpha1.TraceFilterPolicy")
 }
 
 func unmarshalPolicyProto(typedConfig *anypb.Any, target proto.Message) error {

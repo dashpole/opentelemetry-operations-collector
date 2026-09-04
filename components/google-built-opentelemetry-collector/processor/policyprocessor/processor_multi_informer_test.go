@@ -906,3 +906,145 @@ func TestPolicyProcessor_WatchReconnectionAndReconciliation(t *testing.T) {
 	require.Equal(t, 1, out.LogRecordCount())
 	assert.Equal(t, "DEBUG", out.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).SeverityText())
 }
+
+func TestPolicyProcessor_ReviewerEdgeCases(t *testing.T) {
+	// 1. Duplicate informer extension validation error in Config.Validate()
+	dupID := component.MustNewID("googlexdspolicy")
+	cfgDup := &Config{
+		InformerExtensions: []component.ID{dupID, dupID},
+	}
+	require.Error(t, cfgDup.Validate())
+	assert.Contains(t, cfgDup.Validate().Error(), "duplicate informer extension")
+
+	// 2. Fallback to event.Policy.TypedConfig.TypeUrl when event.TypeURL is empty
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	broadcaster := controlplane.NewPolicyBroadcaster()
+	broadcaster.MarkReady()
+	mockInf := &mockInformerExtension{broadcaster}
+	id := component.MustNewID("googlexdspolicy")
+	host := newMockHost(map[component.ID]component.Component{
+		id: mockInf,
+	})
+
+	cfg := &Config{
+		InformerExtensions: []component.ID{id},
+		StartupTimeout:     1 * time.Second,
+	}
+	set := processortest.NewNopSettings(processortest.NopType)
+	set.Logger = zap.NewNop()
+
+	proc, err := newPolicyProcessor(set, cfg)
+	require.NoError(t, err)
+
+	err = proc.Start(ctx, host)
+	require.NoError(t, err)
+	defer func() { _ = proc.Shutdown(ctx) }()
+
+	// 3. Idempotent Start() call: calling Start() a second time is a safe no-op
+	err = proc.Start(ctx, host)
+	require.NoError(t, err)
+
+	// Emit event with TypeURL: "" but event.Policy.TypedConfig.TypeUrl set
+	pol := makeLogPolicy("empty-typeurl-rule", policyv1alpha1.Action_ACTION_DROP, "TEST_SEV")
+	broadcaster.Broadcast(controlplane.PolicyWatchEvent{
+		Type:     controlplane.EventAdded,
+		TypeURL:  "", // Empty!
+		PolicyID: "empty-typeurl-rule",
+		Policy:   pol,
+	})
+
+	require.Eventually(t, func() bool {
+		c := proc.compiled.Load()
+		return c != nil && len(c.LogPolicies) == 1 && c.LogPolicies[0].ID == "empty-typeurl-rule"
+	}, 3*time.Second, 20*time.Millisecond)
+
+	// 4. Non-telemetry policy (non-google.telemetry.policy.v1alpha1) is safely ignored
+	foreignPol := &v3.TypedExtensionConfig{
+		Name: "foreign-rule",
+		TypedConfig: &anypb.Any{
+			TypeUrl: "some.other.package.v1.LogFilterPolicy",
+			Value:   []byte("bogus"),
+		},
+	}
+	broadcaster.Broadcast(controlplane.PolicyWatchEvent{
+		Type:     controlplane.EventAdded,
+		TypeURL:  "some.other.package.v1.LogFilterPolicy",
+		PolicyID: "foreign-rule",
+		Policy:   foreignPol,
+	})
+
+	// Ensure it is not added
+	time.Sleep(100 * time.Millisecond)
+	c := proc.compiled.Load()
+	require.NotNil(t, c)
+	assert.Len(t, c.LogPolicies, 1)
+	assert.Equal(t, "empty-typeurl-rule", c.LogPolicies[0].ID)
+
+	// 5. Static policy deduplication with embedded rule["id"]
+	broadcasterStatic := controlplane.NewPolicyBroadcaster()
+	broadcasterStatic.MarkReady()
+	mockInfStatic := &mockInformerExtension{broadcasterStatic}
+	hostStatic := newMockHost(map[component.ID]component.Component{
+		id: mockInfStatic,
+	})
+
+	cfgStatic := &Config{
+		InformerExtensions: []component.ID{id},
+		Policies: []PolicyConfig{
+			{
+				ID:      "", // empty top-level ID
+				TypeURL: TypeURLLogFilterPolicy,
+				Rule: map[string]any{
+					"id":     "empty-typeurl-rule", // same ID as dynamic informer rule
+					"action": "ACTION_KEEP",
+					"matches": []any{
+						map[string]any{
+							"target": map[string]any{
+								"record_field": "LOG_RECORD_FIELD_SEVERITY_TEXT",
+							},
+							"exact": "INFO",
+						},
+					},
+				},
+			},
+			{
+				ID:      "", // empty top-level ID
+				TypeURL: TypeURLLogFilterPolicy,
+				Rule: map[string]any{
+					"id":     "distinct-static-rule",
+					"action": "ACTION_DROP",
+					"matches": []any{
+						map[string]any{
+							"target": map[string]any{
+								"record_field": "LOG_RECORD_FIELD_SEVERITY_TEXT",
+							},
+							"exact": "DEBUG",
+						},
+					},
+				},
+			},
+		},
+	}
+	procStatic, err := newPolicyProcessor(set, cfgStatic)
+	require.NoError(t, err)
+	err = procStatic.Start(ctx, hostStatic)
+	require.NoError(t, err)
+	defer func() { _ = procStatic.Shutdown(ctx) }()
+
+	// Dynamic rule from broadcaster arrives via UpdatePolicies
+	broadcasterStatic.UpdatePolicies([]*v3.TypedExtensionConfig{pol})
+
+	require.Eventually(t, func() bool {
+		cs := procStatic.compiled.Load()
+		// Should have 2 policies: 1 from informer ("empty-typeurl-rule") which overrides the static one with the same ID,
+		// and 1 from the second static rule ("distinct-static-rule") whose embedded ID was distinct!
+		return cs != nil && len(cs.LogPolicies) == 2
+	}, 3*time.Second, 20*time.Millisecond)
+
+	cs := procStatic.compiled.Load()
+	assert.Equal(t, "empty-typeurl-rule", cs.LogPolicies[0].ID)
+	assert.Equal(t, "distinct-static-rule", cs.LogPolicies[1].ID)
+}
+

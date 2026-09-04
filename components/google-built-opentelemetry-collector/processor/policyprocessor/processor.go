@@ -51,6 +51,7 @@ type policyProcessor struct {
 	ctx                  context.Context
 	cancel               context.CancelFunc
 	wg                   sync.WaitGroup
+	started              atomic.Bool
 	informerExtensions   []component.ID
 	startupTimeout       time.Duration
 	failOnStartupTimeout bool
@@ -102,6 +103,10 @@ func newPolicyProcessor(set processor.Settings, cfg *Config) (*policyProcessor, 
 
 // Start discovers configured informer extensions, validates readiness, and launches background watch loops.
 func (p *policyProcessor) Start(ctx context.Context, host component.Host) error {
+	if !p.started.CompareAndSwap(false, true) {
+		return nil
+	}
+
 	if len(p.informerExtensions) == 0 {
 		return nil
 	}
@@ -120,12 +125,19 @@ func (p *policyProcessor) Start(ctx context.Context, host component.Host) error 
 		informers[id.String()] = informer
 	}
 
-	// Wait up to startupTimeout on informer.Ready()
+	// Wait up to startupTimeout across informers on informer.Ready()
+	startupTimeout := p.startupTimeout
+	if startupTimeout <= 0 {
+		startupTimeout = 5 * time.Second
+	}
+	startupTimer := time.NewTimer(startupTimeout)
+	defer startupTimer.Stop()
+
 	for _, id := range p.informerExtensions {
 		informer := informers[id.String()]
 		select {
 		case <-informer.Ready():
-		case <-time.After(p.startupTimeout):
+		case <-startupTimer.C:
 			if p.failOnStartupTimeout {
 				return fmt.Errorf("policy informer %q did not become ready within %v", id, p.startupTimeout)
 			}
@@ -255,7 +267,11 @@ func (p *policyProcessor) handleWatchEvent(informerID string, informer controlpl
 		p.compiled.Store(newCompiled)
 
 	case controlplane.EventAdded, controlplane.EventModified:
-		if !isFilterPolicy(event.TypeURL) {
+		typeURL := event.TypeURL
+		if typeURL == "" && event.Policy != nil && event.Policy.TypedConfig != nil {
+			typeURL = event.Policy.TypedConfig.TypeUrl
+		}
+		if !isFilterPolicy(typeURL) {
 			return
 		}
 
@@ -357,10 +373,17 @@ func (p *policyProcessor) compileLocked() (*CompiledPolicies, error) {
 	// 2. Append any static policies whose IDs haven't been seen
 	for i, staticPol := range p.staticPolicies {
 		pid := staticPol.ID
-		if seenPolicyIDs[pid] {
+		if pid == "" && staticPol.Rule != nil {
+			if rid, ok := staticPol.Rule["id"].(string); ok {
+				pid = rid
+			}
+		}
+		if pid != "" && seenPolicyIDs[pid] {
 			continue
 		}
-		seenPolicyIDs[pid] = true
+		if pid != "" {
+			seenPolicyIDs[pid] = true
+		}
 		if err := compilePolicyConfig(i, staticPol, newCompiled); err != nil {
 			return nil, err
 		}
