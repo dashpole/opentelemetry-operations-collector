@@ -65,6 +65,7 @@ components:
         - transform
         - interval
         - metricsgeneration
+        - policyprocessor
     exporters:
         - debug
         - nop
@@ -108,6 +109,7 @@ components:
         - pprof
         - filestorage
         - googleclientauth
+        - googlecontrolplaneextension
     providers:
         - env
         - file
@@ -115,7 +117,11 @@ components:
         - https
         - yaml
         - googlesecretmanager
+        - googlecontrolplane
 replaces:
+    - from: github.com/GoogleCloudPlatform/opentelemetry-operations-collector
+      to: ../../
+      reason: Reference root module of repository to find dependency packages.
     - from: github.com/buger/jsonparser
       to: github.com/buger/jsonparser v1.1.2
       reason: Force update buger/jsonparser to v1.1.2 to fix vulnerability

@@ -37,6 +37,8 @@ receivers:
 - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.159.0
 
 processors:
+- gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/processor/policyprocessor v0.159.0
+  path: ../components/google-built-opentelemetry-collector/processor/policyprocessor
 - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/attributesprocessor v0.159.0
 - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/cumulativetodeltaprocessor v0.159.0
 - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/deltatocumulativeprocessor v0.159.0
@@ -77,6 +79,8 @@ exporters:
 - gomod: go.opentelemetry.io/collector/exporter/otlphttpexporter v0.159.0
 
 extensions:
+- gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/extension/googlecontrolplaneextension v0.159.0
+  path: ../components/google-built-opentelemetry-collector/extension/googlecontrolplaneextension
 - gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/extension/healthagent v0.159.0
   path: ../components/google-built-opentelemetry-collector/extension/healthagent
 - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/ackextension v0.159.0
@@ -110,6 +114,8 @@ connectors:
 - gomod: go.opentelemetry.io/collector/connector/forwardconnector v0.159.0
 
 providers:
+- gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/confmap/provider/googlecontrolplane v0.159.0
+  path: ../components/google-built-opentelemetry-collector/confmap/provider/googlecontrolplane
 - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/confmap/provider/googlesecretmanagerprovider v0.159.0
 - gomod: go.opentelemetry.io/collector/confmap/provider/envprovider v1.65.0
 - gomod: go.opentelemetry.io/collector/confmap/provider/fileprovider v1.65.0
@@ -118,6 +124,8 @@ providers:
 - gomod: go.opentelemetry.io/collector/confmap/provider/yamlprovider v1.65.0
 
 replaces:
+# Reference root module of repository to find dependency packages.
+- github.com/GoogleCloudPlatform/opentelemetry-operations-collector => ../../
 # Force update buger/jsonparser to v1.1.2 to fix vulnerability
 - github.com/buger/jsonparser => github.com/buger/jsonparser v1.1.2
 

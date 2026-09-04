@@ -12,15 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+processors:
+  policyprocessor:
+    gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/processor/policyprocessor v0.0.0
+    path: "../components/google-built-opentelemetry-collector/processor/policyprocessor"
+
 exporters:
   googleservicecontrol:
     gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/exporter/googleservicecontrolexporter v0.0.0
     path: "../components/google-built-opentelemetry-collector/exporter/googleservicecontrolexporter"
 
 extensions:
+  googlecontrolplaneextension:
+    gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/extension/googlecontrolplaneextension v0.0.0
+    path: "../components/google-built-opentelemetry-collector/extension/googlecontrolplaneextension"
   healthagent:
     gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/extension/healthagent v0.0.0 v0.0.0
     path: "../components/google-built-opentelemetry-collector/extension/healthagent"
   oauth2clientauth:
     gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/oauth2clientauthextension v0.0.0
     path: "../components/google-built-opentelemetry-collector/extension/oauth2clientauthextension"
+
+providers:
+  googlecontrolplane:
+    gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/confmap/provider/googlecontrolplane v0.0.0
+    path: "../components/google-built-opentelemetry-collector/confmap/provider/googlecontrolplane"
