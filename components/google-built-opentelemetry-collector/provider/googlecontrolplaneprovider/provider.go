@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/processor/googlepolicyprocessor"
+	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/provider/googlecontrolplaneprovider/policies/filelog"
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/provider/googlecontrolplaneprovider/policies/gcpdestination"
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/provider/googlecontrolplaneprovider/policies/selfmetrics"
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/pkg/event"
@@ -362,7 +363,17 @@ func (p *provider) evaluatePolicySet(ctx context.Context, collectorID string, fl
 	sourcePolicies := activePolicySet.LoadPoliciesOfClass(googlepolicy.PolicyClassSource)
 
 	appliedSelfMetrics := false
+	var validFileLogPolicies []*filelog.FileLogSourcePolicy
 	for _, sp := range sourcePolicies {
+		if flPolicy, ok := sp.(*filelog.FileLogSourcePolicy); ok {
+			if err := flPolicy.Validate(); err != nil {
+				err = fmt.Errorf("failed to evaluate source policy %q: %w", sp.PolicyName(), err)
+				p.recordPolicyEvaluateError(ctx, sp.PolicyName(), activePolicySet, err, event.WithPolicyEvaluateErrorEventPolicyClass(event.PolicyClassSource))
+				continue
+			}
+			validFileLogPolicies = append(validFileLogPolicies, flPolicy)
+			continue
+		}
 		policyConf, err := p.evaluateSingleSourcePolicy(ctx, collectorID, fleetID, sp, destPolicy, preProcessLogIDs, preProcessMetricIDs, preProcessTraceIDs)
 		if err != nil {
 			p.recordPolicyEvaluateError(ctx, sp.PolicyName(), activePolicySet, err, event.WithPolicyEvaluateErrorEventPolicyClass(event.PolicyClassSource))
@@ -375,6 +386,17 @@ func (p *provider) evaluatePolicySet(ctx context.Context, collectorID string, fl
 		}
 		if sp.PolicyType() == selfmetrics.PolicyType {
 			appliedSelfMetrics = true
+		}
+	}
+
+	if len(validFileLogPolicies) > 0 {
+		mergedFileLog := filelog.MergePolicies(validFileLogPolicies)
+		policyConf, err := p.evaluateSingleSourcePolicy(ctx, collectorID, fleetID, mergedFileLog, destPolicy, preProcessLogIDs, preProcessMetricIDs, preProcessTraceIDs)
+		if err != nil {
+			p.recordPolicyEvaluateError(ctx, mergedFileLog.PolicyName(), activePolicySet, err, event.WithPolicyEvaluateErrorEventPolicyClass(event.PolicyClassSource))
+		} else if err := conf.Merge(policyConf); err != nil {
+			err = fmt.Errorf("failed to merge config for source policy %q: %w", mergedFileLog.PolicyName(), err)
+			p.recordPolicyEvaluateError(ctx, mergedFileLog.PolicyName(), activePolicySet, err, event.WithPolicyEvaluateErrorEventPolicyClass(event.PolicyClassSource))
 		}
 	}
 

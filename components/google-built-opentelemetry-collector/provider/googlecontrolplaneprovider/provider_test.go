@@ -21,6 +21,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/provider/googlecontrolplaneprovider/policies/filelog"
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/provider/googlecontrolplaneprovider/policies/selfmetrics"
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/pkg/event"
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/pkg/googlepolicy"
@@ -631,6 +632,75 @@ func TestRetrieve_BuiltinPolicyErrorDoesNotRollbackActivePolicySet(t *testing.T)
 		"gcp.policy.class":           "source",
 		"context":                    "context.Background",
 	}, entries[0].ContextMap())
+
+	assert.NoError(t, p.Shutdown(context.Background()))
+}
+
+func TestRetrieve_MultipleFileLogPoliciesMergedAndInvalidSkipped(t *testing.T) {
+	t.Setenv("FLEET_ID", "1234")
+	core, recorded := observer.New(zapcore.InfoLevel)
+	logger := zap.New(core)
+	p := createProviderWithLogger(logger)
+
+	ps := &googlepolicy.PolicySet{
+		PolicySetID: "projects/my-project/locations/us-central1/policySets/enterprise-filelog-set",
+		RevisionID:  "rev-filelog-enterprise",
+		Policies: map[string]*googlepolicy.PolicySetEntry{
+			"oracle_audit_policy": {
+				PolicyObj: &filelog.FileLogSourcePolicy{
+					ID:      "oracle_audit_policy",
+					Include: []string{"/u01/app/oracle/admin/ORCL/adump/ora_1234.aud", "/var/adm/messages"},
+				},
+			},
+			"windows_cots_policy": {
+				PolicyObj: &filelog.FileLogSourcePolicy{
+					ID:      "windows_cots_policy",
+					Include: []string{"/var/adm/messages", `D:\AppLogs\sep\agi.log`, `%SystemRoot%\System32\LogFiles\Firewall\pfirewall.log`},
+				},
+			},
+			"invalid_shadow_policy": {
+				PolicyObj: &filelog.FileLogSourcePolicy{
+					ID:      "invalid_shadow_policy",
+					Include: []string{"/etc/shadow"},
+				},
+			},
+		},
+	}
+	googlepolicy.SetActivePolicySet(ps)
+	t.Cleanup(func() {
+		for googlepolicy.ActivePolicySet() != nil {
+			googlepolicy.RollbackActivePolicySet()
+		}
+	})
+
+	ret, err := p.Retrieve(context.Background(), "googlecontrolplane:component:my-config", nil)
+	require.NoError(t, err)
+	require.NotNil(t, ret)
+
+	conf, err := ret.AsConf()
+	require.NoError(t, err)
+
+	// Verify shared filelog receiver has deduplicated, sorted set-union of valid includes:
+	assert.Equal(t, []any{
+		"%SystemRoot%\\System32\\LogFiles\\Firewall\\pfirewall.log",
+		"/u01/app/oracle/admin/ORCL/adump/ora_1234.aud",
+		"/var/adm/messages",
+		"D:\\AppLogs\\sep\\agi.log",
+	}, conf.Get("receivers::filelog::include"))
+	assert.Equal(t, true, conf.Get("receivers::filelog::include_file_path"))
+	assert.Contains(t, conf.Get("receivers::filelog::exclude"), "**/*.gz")
+	assert.Contains(t, conf.Get("receivers::filelog::exclude"), "**/*.key")
+
+	// Verify shared logs/filelog pipeline includes googlepolicy processor and default exporter:
+	assert.Equal(t, []any{"filelog"}, conf.Get("service::pipelines::logs/filelog::receivers"))
+	assert.Contains(t, conf.Get("service::pipelines::logs/filelog::processors"), "googlepolicy")
+	assert.Contains(t, conf.Get("service::pipelines::logs/filelog::exporters"), "otlp_grpc/default_gcp_destination")
+
+	// Verify the invalid /etc/shadow policy recorded a PolicyEvaluateErrorEvent without blocking valid policies:
+	entries := recorded.All()
+	require.Len(t, entries, 1)
+	assert.Contains(t, entries[0].Message, `failed to evaluate source policy "invalid_shadow_policy"`)
+	assert.Contains(t, entries[0].Message, "/etc/**")
 
 	assert.NoError(t, p.Shutdown(context.Background()))
 }
