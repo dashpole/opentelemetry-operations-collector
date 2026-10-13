@@ -22,6 +22,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/processor/googlepolicyprocessor"
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/provider/googlecontrolplaneprovider/policies/gcpdestination"
@@ -39,8 +40,10 @@ import (
 )
 
 const (
-	schemeName               = "googlecontrolplane"
-	mergeAppendFeatureGateID = "confmap.enableMergeAppendOption"
+	schemeName                   = "googlecontrolplane"
+	mergeAppendFeatureGateID     = "confmap.enableMergeAppendOption"
+	partialReloadFeatureGateID   = "service.partialReload"
+	partialReloadReceiversGateID = "service.partialReloadReceivers"
 )
 
 var (
@@ -82,6 +85,21 @@ type provider struct {
 	logger *zap.Logger
 
 	manager googlepolicy.Manager
+
+	// diffGateReloads controls whether the provider compares the newly
+	// synthesized confmap against the last returned confmap before invoking
+	// confmap.WatcherFunc. Enabled by default; tests can set it to false to
+	// reproduce baseline unconditional reload behavior.
+	diffGateReloads bool
+
+	mu             sync.Mutex
+	lastConfMap    map[string]any
+	pendingConfMap map[string]any
+	pendingRevID   string
+	hasPending     bool
+
+	watchStopMu sync.Mutex
+	watchStopFn func()
 }
 
 // NewFactory returns a new confmap.ProviderFactory that creates a Google Control Plane configuration provider.
@@ -94,11 +112,18 @@ func newProvider(set confmap.ProviderSettings) confmap.Provider {
 	// deduplicates service::extensions, service::**::receivers, and
 	// service::**::exporters slices across policies and across multiple
 	// confmap providers (e.g. file: + googlecontrolplane:).
-	if err := featuregate.GlobalRegistry().Set(mergeAppendFeatureGateID, true); err != nil && set.Logger != nil {
-		set.Logger.Warn("failed to enable confmap merge append feature gate", zap.Error(err))
+	for _, gateID := range []string{
+		mergeAppendFeatureGateID,
+		partialReloadFeatureGateID,
+		partialReloadReceiversGateID,
+	} {
+		if err := featuregate.GlobalRegistry().Set(gateID, true); err != nil && set.Logger != nil {
+			set.Logger.Warn("failed to enable feature gate", zap.String("gate", gateID), zap.Error(err))
+		}
 	}
 	return &provider{
-		logger: set.Logger,
+		logger:          set.Logger,
+		diffGateReloads: true,
 	}
 }
 
@@ -181,7 +206,7 @@ func (p *provider) Retrieve(ctx context.Context, uri string, watcher confmap.Wat
 		if p.manager.URI().String() != target.String() {
 			return nil, fmt.Errorf("%q: %w: %s", uri, ErrManagerAlreadyConfigured, target)
 		} else {
-			return p.evaluateActivePolicySet(ctx)
+			return p.retrieveAndWatch(ctx, watcher)
 		}
 	}
 
@@ -212,7 +237,177 @@ func (p *provider) Retrieve(ctx context.Context, uri string, watcher confmap.Wat
 		return nil, fmt.Errorf("%q: %w: %s", uri, ErrURIInvalidInnerScheme, target.Scheme)
 	}
 
-	return p.evaluateActivePolicySet(ctx)
+	return p.retrieveAndWatch(ctx, watcher)
+}
+
+func (p *provider) retrieveAndWatch(ctx context.Context, watcher confmap.WatcherFunc) (*confmap.Retrieved, error) {
+	p.stopPolicyWatcher()
+
+	var confMap map[string]any
+	currentRevID := googlepolicy.ActivePolicySetRevisionID()
+
+	p.mu.Lock()
+	if p.hasPending && p.pendingRevID == currentRevID {
+		confMap = p.pendingConfMap
+		p.pendingConfMap = nil
+		p.hasPending = false
+		p.lastConfMap = cloneConfMap(confMap)
+		p.mu.Unlock()
+	} else {
+		p.pendingConfMap = nil
+		p.hasPending = false
+		p.mu.Unlock()
+
+		ret, err := p.evaluateActivePolicySet(ctx)
+		if err != nil {
+			return nil, err
+		}
+		conf, err := ret.AsConf()
+		if err != nil {
+			return nil, err
+		}
+		confMap = conf.ToStringMap()
+		currentRevID = googlepolicy.ActivePolicySetRevisionID()
+
+		p.mu.Lock()
+		p.lastConfMap = cloneConfMap(confMap)
+		p.mu.Unlock()
+	}
+
+	if watcher == nil {
+		return confmap.NewRetrieved(confMap)
+	}
+
+	stopFn := p.startPolicyWatcher(ctx, currentRevID, watcher)
+	return confmap.NewRetrieved(
+		confMap,
+		confmap.WithRetrievedClose(func(context.Context) error {
+			stopFn()
+			return nil
+		}),
+	)
+}
+
+func (p *provider) startPolicyWatcher(ctx context.Context, evaluatedRevID string, watcher confmap.WatcherFunc) func() {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	watchCtx := context.WithoutCancel(ctx)
+	watcherCh := googlepolicy.RegisterWatcherChannel()
+	stopCh := make(chan struct{})
+	var stopOnce sync.Once
+	var wg sync.WaitGroup
+
+	stopFn := func() {
+		stopOnce.Do(func() {
+			close(stopCh)
+			googlepolicy.UnregisterWatcherChannel(watcherCh)
+			wg.Wait()
+		})
+	}
+
+	p.watchStopMu.Lock()
+	p.watchStopFn = stopFn
+	p.watchStopMu.Unlock()
+
+	initialChanged := googlepolicy.ActivePolicySetRevisionID() != evaluatedRevID
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		handlePolicyChange := func() bool {
+			newRet, err := p.evaluateActivePolicySet(watchCtx)
+			if err != nil {
+				select {
+				case <-stopCh:
+					return true
+				default:
+				}
+				watcher(&confmap.ChangeEvent{Error: err})
+				return true
+			}
+
+			newConf, err := newRet.AsConf()
+			if err != nil {
+				select {
+				case <-stopCh:
+					return true
+				default:
+				}
+				watcher(&confmap.ChangeEvent{Error: err})
+				return true
+			}
+			newMap := newConf.ToStringMap()
+			revID := googlepolicy.ActivePolicySetRevisionID()
+
+			p.mu.Lock()
+			unchanged := p.diffGateReloads && reflect.DeepEqual(p.lastConfMap, newMap)
+			if !unchanged {
+				p.lastConfMap = cloneConfMap(newMap)
+				p.pendingConfMap = cloneConfMap(newMap)
+				p.pendingRevID = revID
+				p.hasPending = true
+			}
+			p.mu.Unlock()
+
+			if unchanged {
+				if p.logger != nil {
+					p.logger.Debug("Synthesized confmap unchanged after policy set update; skipping collector reload",
+						zap.String("revision_id", revID),
+					)
+				}
+				return false
+			}
+
+			select {
+			case <-stopCh:
+				return true
+			default:
+			}
+			watcher(&confmap.ChangeEvent{})
+			return true
+		}
+
+		if initialChanged {
+			if handlePolicyChange() {
+				return
+			}
+		}
+
+		for {
+			select {
+			case <-stopCh:
+				return
+			case _, ok := <-watcherCh:
+				if !ok {
+					return
+				}
+				if handlePolicyChange() {
+					return
+				}
+			}
+		}
+	}()
+
+	return stopFn
+}
+
+func (p *provider) stopPolicyWatcher() {
+	p.watchStopMu.Lock()
+	stopFn := p.watchStopFn
+	p.watchStopFn = nil
+	p.watchStopMu.Unlock()
+	if stopFn != nil {
+		stopFn()
+	}
+}
+
+func cloneConfMap(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	return confmap.NewFromStringMap(m).ToStringMap()
 }
 
 func (p *provider) evaluateActivePolicySet(ctx context.Context) (*confmap.Retrieved, error) {
@@ -530,6 +725,7 @@ func (*provider) Scheme() string {
 
 // Shutdown shuts down the provider and releases any held resources.
 func (p *provider) Shutdown(context.Context) error {
+	p.stopPolicyWatcher()
 	if p.manager != nil {
 		p.manager.Stop()
 	}

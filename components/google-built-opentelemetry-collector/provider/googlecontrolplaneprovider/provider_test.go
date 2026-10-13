@@ -19,7 +19,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/provider/googlecontrolplaneprovider/policies/selfmetrics"
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/pkg/event"
@@ -29,6 +31,8 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/collector/confmap/confmaptest"
+	"go.opentelemetry.io/collector/featuregate"
+	"go.opentelemetry.io/collector/service"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
@@ -633,4 +637,195 @@ func TestRetrieve_BuiltinPolicyErrorDoesNotRollbackActivePolicySet(t *testing.T)
 	}, entries[0].ContextMap())
 
 	assert.NoError(t, p.Shutdown(context.Background()))
+}
+
+func TestPartialReloadFeatureGatesEnabled(t *testing.T) {
+	require.NoError(t, featuregate.GlobalRegistry().Set(partialReloadFeatureGateID, false))
+	require.NoError(t, featuregate.GlobalRegistry().Set(partialReloadReceiversGateID, false))
+	assert.False(t, service.ReceiverPartialReloadEnabled())
+
+	p := createProvider()
+	assert.True(t, service.ReceiverPartialReloadEnabled(), "creating googlecontrolplaneprovider must enable service.partialReload and service.partialReloadReceivers")
+	assert.NoError(t, p.Shutdown(context.Background()))
+}
+
+func TestWatcher_DiffGatedVsBaseline(t *testing.T) {
+	t.Setenv("FLEET_ID", "1234")
+	cleanupPolicySets := func() {
+		for googlepolicy.ActivePolicySet() != nil {
+			googlepolicy.RollbackActivePolicySet()
+		}
+	}
+	t.Cleanup(cleanupPolicySets)
+
+	makeLogFilterPolicy := func(id, bodySubstring string) googlepolicy.Policy {
+		pol, err := googlepolicy.LoadPolicy("log_filter", map[string]any{
+			"type":   "log_filter",
+			"id":     id,
+			"action": "ACTION_DROP",
+			"matches": []any{
+				map[string]any{
+					"target": map[string]any{"record_field": "LOG_RECORD_FIELD_BODY"},
+					"regex":  bodySubstring,
+				},
+			},
+		})
+		require.NoError(t, err)
+		return pol
+	}
+
+	t.Run("baseline_unconditional_watcher_fires_on_log_filter_only", func(t *testing.T) {
+		cleanupPolicySets()
+		p := createProvider()
+		p.(*provider).diffGateReloads = false
+		t.Cleanup(func() {
+			assert.NoError(t, p.Shutdown(context.Background()))
+		})
+
+		var watcherCalls atomic.Int32
+		watcherCh := make(chan *confmap.ChangeEvent, 4)
+		watcher := func(ev *confmap.ChangeEvent) {
+			watcherCalls.Add(1)
+			watcherCh <- ev
+		}
+
+		ret, err := p.Retrieve(context.Background(), "googlecontrolplane:component:my-config", watcher)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			assert.NoError(t, ret.Close(context.Background()))
+		})
+
+		// Rolling out a LogFilterPolicy-only revision with diffGateReloads=false
+		// unconditionally fires WatcherFunc even though the synthesized confmap is identical.
+		filter1 := makeLogFilterPolicy("filter-1", "secret")
+		googlepolicy.SetActivePolicySet(&googlepolicy.PolicySet{
+			RevisionID: "rev-baseline-filter-1",
+			Policies: map[string]*googlepolicy.PolicySetEntry{
+				filter1.PolicyName(): {PolicyObj: filter1},
+			},
+		})
+
+		select {
+		case ev := <-watcherCh:
+			require.NotNil(t, ev)
+			assert.NoError(t, ev.Error)
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected unconditional baseline watcher to fire on LogFilterPolicy update")
+		}
+		assert.Equal(t, int32(1), watcherCalls.Load())
+	})
+
+	t.Run("prototype_diff_gated_watcher_suppresses_filter_only_and_fires_on_source", func(t *testing.T) {
+		cleanupPolicySets()
+		core, recorded := observer.New(zapcore.DebugLevel)
+		p := createProviderWithLogger(zap.New(core))
+		t.Cleanup(func() {
+			assert.NoError(t, p.Shutdown(context.Background()))
+		})
+
+		var watcherCalls atomic.Int32
+		watcherCh := make(chan *confmap.ChangeEvent, 4)
+		watcher := func(ev *confmap.ChangeEvent) {
+			watcherCalls.Add(1)
+			watcherCh <- ev
+		}
+
+		ret1, err := p.Retrieve(context.Background(), "googlecontrolplane:component:my-config", watcher)
+		require.NoError(t, err)
+
+		// 1. Roll out LogFilterPolicy revision 1 -> synthesized confmap is identical -> 0 watcher calls.
+		filter1 := makeLogFilterPolicy("filter-1", "drop-1")
+		googlepolicy.SetActivePolicySet(&googlepolicy.PolicySet{
+			RevisionID: "rev-proto-filter-1",
+			Policies: map[string]*googlepolicy.PolicySetEntry{
+				filter1.PolicyName(): {PolicyObj: filter1},
+			},
+		})
+		require.Eventually(t, func() bool {
+			return len(recorded.FilterMessage("Synthesized confmap unchanged after policy set update; skipping collector reload").All()) >= 1
+		}, 2*time.Second, 10*time.Millisecond)
+		assert.Equal(t, int32(0), watcherCalls.Load(), "diff-gated watcher must not fire on LogFilterPolicy update")
+
+		// 2. Roll out LogFilterPolicy revision 2 -> still identical confmap -> 0 watcher calls.
+		filter2 := makeLogFilterPolicy("filter-2", "drop-2")
+		googlepolicy.SetActivePolicySet(&googlepolicy.PolicySet{
+			RevisionID: "rev-proto-filter-2",
+			Policies: map[string]*googlepolicy.PolicySetEntry{
+				filter1.PolicyName(): {PolicyObj: filter1},
+				filter2.PolicyName(): {PolicyObj: filter2},
+			},
+		})
+		require.Eventually(t, func() bool {
+			return len(recorded.FilterMessage("Synthesized confmap unchanged after policy set update; skipping collector reload").All()) >= 2
+		}, 2*time.Second, 10*time.Millisecond)
+		assert.Equal(t, int32(0), watcherCalls.Load())
+
+		// 3. Roll out an invalid PolicySet (2 destination policies) -> rolls back to rev-proto-filter-2 -> identical confmap -> 0 watcher calls.
+		googlepolicy.SetActivePolicySet(&googlepolicy.PolicySet{
+			RevisionID: "rev-proto-invalid-dest",
+			Policies: map[string]*googlepolicy.PolicySetEntry{
+				"dest1": {PolicyObj: &mockDestinationPolicy{name: "dest1"}},
+				"dest2": {PolicyObj: &mockDestinationPolicy{name: "dest2"}},
+			},
+		})
+		require.Eventually(t, func() bool {
+			return len(recorded.FilterMessage("Synthesized confmap unchanged after policy set update; skipping collector reload").All()) >= 3
+		}, 2*time.Second, 10*time.Millisecond)
+		assert.Equal(t, int32(0), watcherCalls.Load(), "rollback to previous PolicySet with identical confmap must not fire watcher")
+		assert.Equal(t, "rev-proto-filter-2", googlepolicy.ActivePolicySetRevisionID())
+
+		// 4. Roll out a SourcePolicy update (plus a non-fatal failing source to verify no duplicate error events on Retrieve).
+		failingSource := &mockSourcePolicy{name: "failing_src", evalErr: errors.New("broken source")}
+		validSource := &mockSourcePolicy{name: "source_a"}
+		googlepolicy.SetActivePolicySet(&googlepolicy.PolicySet{
+			PolicySetID: "projects/my-project/locations/us-central1/policySets/ps-1",
+			RevisionID:  "rev-proto-source-1",
+			Policies: map[string]*googlepolicy.PolicySetEntry{
+				filter1.PolicyName(): {PolicyObj: filter1},
+				"failing_src":        {PolicyObj: failingSource},
+				"source_a":           {PolicyObj: validSource},
+			},
+		})
+
+		select {
+		case ev := <-watcherCh:
+			require.NotNil(t, ev)
+			assert.NoError(t, ev.Error)
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected diff-gated watcher to fire when SourcePolicy changes synthesized confmap")
+		}
+		assert.Equal(t, int32(1), watcherCalls.Load())
+
+		// Simulate confmap.Resolver.Resolve: close previous Retrieved, then call Retrieve with watcher again.
+		require.NoError(t, ret1.Close(context.Background()))
+		ret2, err := p.Retrieve(context.Background(), "googlecontrolplane:component:my-config", watcher)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			assert.NoError(t, ret2.Close(context.Background()))
+		})
+
+		conf2, err := ret2.AsConf()
+		require.NoError(t, err)
+		assert.True(t, conf2.IsSet("receivers::otlp/source_a"))
+
+		// Verify failing_src only emitted 1 PolicyEvaluateErrorEvent across the watcher pre-eval + Retrieve.
+		evalErrLogs := recorded.FilterMessageSnippet("failed to evaluate source policy \"failing_src\"").All()
+		assert.Len(t, evalErrLogs, 1, "consuming pendingConfMap in Retrieve must not double-evaluate or double-log policy errors")
+
+		// 5. Roll out another LogFilterPolicy update after the reload -> new watcher goroutine suppresses it.
+		filter3 := makeLogFilterPolicy("filter-3", "drop-3")
+		googlepolicy.SetActivePolicySet(&googlepolicy.PolicySet{
+			PolicySetID: "projects/my-project/locations/us-central1/policySets/ps-1",
+			RevisionID:  "rev-proto-source-1-plus-filter-3",
+			Policies: map[string]*googlepolicy.PolicySetEntry{
+				filter1.PolicyName(): {PolicyObj: filter1},
+				filter3.PolicyName(): {PolicyObj: filter3},
+				"source_a":           {PolicyObj: validSource},
+			},
+		})
+		require.Eventually(t, func() bool {
+			return len(recorded.FilterMessage("Synthesized confmap unchanged after policy set update; skipping collector reload").All()) >= 4
+		}, 2*time.Second, 10*time.Millisecond)
+		assert.Equal(t, int32(1), watcherCalls.Load(), "subsequent LogFilterPolicy update after reload must also be suppressed")
+	})
 }
