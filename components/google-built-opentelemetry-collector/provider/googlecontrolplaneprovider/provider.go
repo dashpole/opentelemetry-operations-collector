@@ -35,12 +35,16 @@ import (
 	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/collector/featuregate"
 	"go.opentelemetry.io/collector/otelcol"
+	"go.opentelemetry.io/collector/pipeline"
+	"go.opentelemetry.io/collector/service"
+	"go.opentelemetry.io/collector/service/pipelines"
 	"go.uber.org/zap"
 )
 
 const (
 	schemeName               = "googlecontrolplane"
 	mergeAppendFeatureGateID = "confmap.enableMergeAppendOption"
+	canonicalPipelineName    = "googlecontrolplane"
 )
 
 var (
@@ -71,9 +75,8 @@ var (
 )
 
 const (
-	innerSchemeFile      = "file"
-	innerSchemeComponent = "component"
-	innerSchemeXDS       = "xds"
+	innerSchemeFile = "file"
+	innerSchemeXDS  = "xds"
 )
 
 var _ confmap.Provider = (*provider)(nil)
@@ -174,10 +177,9 @@ func (p *provider) Retrieve(ctx context.Context, uri string, watcher confmap.Wat
 	// * some other provider has triggered a full confmap resolution (the URI will be the same)
 	// * the user configured two `googlecontrolplane` providers with different URIs
 	//
-	// The user can configure as many `component://` URIs as they want, but if it's anything
-	// else we need to disambiguate between the two cases above, and fail if the user is trying
+	// Disambiguate between the two cases above, and fail if the user is trying
 	// to configure additional policy source URIs.
-	if target.Scheme != innerSchemeComponent && p.manager != nil {
+	if p.manager != nil {
 		if p.manager.URI().String() != target.String() {
 			return nil, fmt.Errorf("%q: %w: %s", uri, ErrManagerAlreadyConfigured, target)
 		} else {
@@ -207,7 +209,6 @@ func (p *provider) Retrieve(ctx context.Context, uri string, watcher confmap.Wat
 		if err := p.manager.Start(); err != nil {
 			return nil, fmt.Errorf("%q: %w", uri, err)
 		}
-	case innerSchemeComponent:
 	default:
 		return nil, fmt.Errorf("%q: %w: %s", uri, ErrURIInvalidInnerScheme, target.Scheme)
 	}
@@ -358,6 +359,27 @@ func (p *provider) evaluatePolicySet(ctx context.Context, collectorID string, fl
 	preProcessMetricIDs := append([]component.ID{googlePolicyID}, destPolicy.PreProcessMetricIDs()...)
 	preProcessTraceIDs := append([]component.ID{googlePolicyID}, destPolicy.PreProcessTraceIDs()...)
 
+	// Always synthesize the canonical workload pipelines (logs/googlecontrolplane,
+	// metrics/googlecontrolplane, traces/googlecontrolplane) pre-wired with a
+	// built-in nop/googlecontrolplane receiver, the googlepolicy processor, the
+	// destination policy's pre-export processors, and the destination exporters.
+	// With confmap.enableMergeAppendOption enabled, both remote SourcePolicy
+	// instances and local file:/etc/otelcol-google/config.yaml receivers append
+	// into service.pipelines.<signal>/googlecontrolplane.receivers while sharing
+	// a single googlepolicy and queue_batch processor instance per signal.
+	canonicalConf, err := synthesizeCanonicalWorkloadPipelines(
+		preProcessLogIDs,
+		preProcessMetricIDs,
+		preProcessTraceIDs,
+		destPolicy.ExporterIDs(),
+	)
+	if err != nil {
+		return nil, true, fmt.Errorf("failed to synthesize canonical workload pipelines: %w", err)
+	}
+	if err := conf.Merge(cleanConf(canonicalConf)); err != nil {
+		return nil, true, fmt.Errorf("failed to merge canonical workload pipelines: %w", err)
+	}
+
 	// Load all source policies from the active policy set.
 	sourcePolicies := activePolicySet.LoadPoliciesOfClass(googlepolicy.PolicyClassSource)
 
@@ -466,6 +488,12 @@ func (p *provider) evaluateSingleSourcePolicy(
 		return nil, fmt.Errorf("failed to load logs pipelines for source policy %q: %w", sp.PolicyName(), err)
 	}
 	if logsPipelines != nil {
+		if sp.PolicyType() != selfmetrics.PolicyType {
+			logsPipelines, err = canonicalizeWorkloadPipelineConf(logsPipelines, pipeline.SignalLogs)
+			if err != nil {
+				return nil, fmt.Errorf("failed to canonicalize logs pipelines for source policy %q: %w", sp.PolicyName(), err)
+			}
+		}
 		if err := policyConf.Merge(cleanConf(logsPipelines)); err != nil {
 			return nil, fmt.Errorf("failed to merge logs pipelines for source policy %q: %w", sp.PolicyName(), err)
 		}
@@ -476,6 +504,12 @@ func (p *provider) evaluateSingleSourcePolicy(
 		return nil, fmt.Errorf("failed to load metrics pipelines for source policy %q: %w", sp.PolicyName(), err)
 	}
 	if metricsPipelines != nil {
+		if sp.PolicyType() != selfmetrics.PolicyType {
+			metricsPipelines, err = canonicalizeWorkloadPipelineConf(metricsPipelines, pipeline.SignalMetrics)
+			if err != nil {
+				return nil, fmt.Errorf("failed to canonicalize metrics pipelines for source policy %q: %w", sp.PolicyName(), err)
+			}
+		}
 		if err := policyConf.Merge(cleanConf(metricsPipelines)); err != nil {
 			return nil, fmt.Errorf("failed to merge metrics pipelines for source policy %q: %w", sp.PolicyName(), err)
 		}
@@ -486,12 +520,100 @@ func (p *provider) evaluateSingleSourcePolicy(
 		return nil, fmt.Errorf("failed to load traces pipelines for source policy %q: %w", sp.PolicyName(), err)
 	}
 	if tracesPipelines != nil {
+		if sp.PolicyType() != selfmetrics.PolicyType {
+			tracesPipelines, err = canonicalizeWorkloadPipelineConf(tracesPipelines, pipeline.SignalTraces)
+			if err != nil {
+				return nil, fmt.Errorf("failed to canonicalize traces pipelines for source policy %q: %w", sp.PolicyName(), err)
+			}
+		}
 		if err := policyConf.Merge(cleanConf(tracesPipelines)); err != nil {
 			return nil, fmt.Errorf("failed to merge traces pipelines for source policy %q: %w", sp.PolicyName(), err)
 		}
 	}
 
 	return policyConf, nil
+}
+
+func synthesizeCanonicalWorkloadPipelines(
+	preProcessLogIDs []component.ID,
+	preProcessMetricIDs []component.ID,
+	preProcessTraceIDs []component.ID,
+	exporters []component.ID,
+) (*confmap.Conf, error) {
+	nopType, _ := component.NewType("nop")
+	nopReceiverID := component.NewIDWithName(nopType, canonicalPipelineName)
+
+	logsPipeID := pipeline.NewIDWithName(pipeline.SignalLogs, canonicalPipelineName)
+	metricsPipeID := pipeline.NewIDWithName(pipeline.SignalMetrics, canonicalPipelineName)
+	tracesPipeID := pipeline.NewIDWithName(pipeline.SignalTraces, canonicalPipelineName)
+
+	conf := &otelcol.Config{
+		Receivers: map[component.ID]component.Config{
+			nopReceiverID: component.Config(map[string]any{}),
+		},
+		Service: service.Config{
+			Pipelines: pipelines.Config{
+				logsPipeID: &pipelines.PipelineConfig{
+					Receivers:  []component.ID{nopReceiverID},
+					Processors: preProcessLogIDs,
+					Exporters:  exporters,
+				},
+				metricsPipeID: &pipelines.PipelineConfig{
+					Receivers:  []component.ID{nopReceiverID},
+					Processors: preProcessMetricIDs,
+					Exporters:  exporters,
+				},
+				tracesPipeID: &pipelines.PipelineConfig{
+					Receivers:  []component.ID{nopReceiverID},
+					Processors: preProcessTraceIDs,
+					Exporters:  exporters,
+				},
+			},
+		},
+	}
+
+	cm := confmap.New()
+	if err := cm.Marshal(conf); err != nil {
+		return nil, err
+	}
+	return cm, nil
+}
+
+func canonicalizeWorkloadPipelineConf(c *confmap.Conf, sig pipeline.Signal) (*confmap.Conf, error) {
+	if c == nil {
+		return nil, nil
+	}
+	m := cleanConf(c).ToStringMap()
+	srvMap, ok := m["service"].(map[string]any)
+	if !ok {
+		return c, nil
+	}
+	pipesMap, ok := srvMap["pipelines"].(map[string]any)
+	if !ok {
+		return c, nil
+	}
+
+	canonicalKey := pipeline.NewIDWithName(sig, canonicalPipelineName).String()
+	prefix := sig.String() + "/"
+
+	out := confmap.New()
+	for k, v := range pipesMap {
+		targetKey := k
+		if strings.HasPrefix(k, prefix) || k == sig.String() {
+			targetKey = canonicalKey
+		}
+		single := confmap.NewFromStringMap(map[string]any{
+			"service": map[string]any{
+				"pipelines": map[string]any{
+					targetKey: v,
+				},
+			},
+		})
+		if err := out.Merge(cleanConf(single)); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 func cleanConf(c *confmap.Conf) *confmap.Conf {

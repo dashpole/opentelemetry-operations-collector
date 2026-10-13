@@ -19,6 +19,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"path/filepath"
 	"testing"
 
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/provider/googlecontrolplaneprovider/policies/selfmetrics"
@@ -77,10 +79,49 @@ func TestEmptyTarget(t *testing.T) {
 	assert.NoError(t, p.Shutdown(context.Background()))
 }
 
+func retrieveForTest(t *testing.T, p confmap.Provider) (*confmap.Retrieved, error) {
+	t.Helper()
+	t.Cleanup(func() {
+		for googlepolicy.ActivePolicySet() != nil {
+			googlepolicy.RollbackActivePolicySet()
+		}
+	})
+	dir := filepath.ToSlash(t.TempDir())
+	rawURI := "googlecontrolplane:file://" + dir
+	if googlepolicy.ActivePolicySet() != nil {
+		// Pre-bind the file manager so Retrieve evaluates the caller's injected
+		// in-memory PolicySet rather than overwriting it from the empty temp dir.
+		target, err := url.Parse("file://" + dir)
+		require.NoError(t, err)
+		mgr, err := googlepolicy.NewFilePolicyManager(nil, target)
+		require.NoError(t, err)
+		p.(*provider).manager = mgr
+	}
+	return p.Retrieve(context.Background(), rawURI, nil)
+}
+
+func TestRetrieve_ComponentSchemeRejected(t *testing.T) {
+	t.Setenv("FLEET_ID", "1234")
+	for _, uri := range []string{
+		"googlecontrolplane:component:my-config",
+		"googlecontrolplane:component://global_policy_processor",
+		"googlecontrolplane:component://active_destination_log_preprocess",
+		"googlecontrolplane:component://active_destination_exporter",
+	} {
+		t.Run(uri, func(t *testing.T) {
+			p := createProvider()
+			_, err := p.Retrieve(context.Background(), uri, nil)
+			require.Error(t, err)
+			assert.ErrorIs(t, err, ErrURIInvalidInnerScheme)
+			assert.NoError(t, p.Shutdown(context.Background()))
+		})
+	}
+}
+
 func TestRetrieve(t *testing.T) {
 	t.Setenv("FLEET_ID", "1234")
 	p := createProvider()
-	ret, err := p.Retrieve(context.Background(), "googlecontrolplane:component:my-config", nil)
+	ret, err := retrieveForTest(t, p)
 	require.NoError(t, err)
 	require.NotNil(t, ret)
 
@@ -88,11 +129,15 @@ func TestRetrieve(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotNil(t, conf)
 
-	// Verify both destination policy and selfmetrics policy configurations are merged
+	// Verify destination policy, canonical workload pipelines, and selfmetrics configurations are merged
 	assert.True(t, conf.IsSet("extensions::googleclientauth/default_gcp_destination"))
 	assert.True(t, conf.IsSet("exporters::otlp_grpc/default_gcp_destination"))
+	assert.True(t, conf.IsSet("receivers::nop/googlecontrolplane"))
 	assert.True(t, conf.IsSet("receivers::otlp/default_self_metrics"))
 	assert.True(t, conf.IsSet("service::telemetry::resource::attributes"))
+	assert.True(t, conf.IsSet("service::pipelines::logs/googlecontrolplane"))
+	assert.True(t, conf.IsSet("service::pipelines::metrics/googlecontrolplane"))
+	assert.True(t, conf.IsSet("service::pipelines::traces/googlecontrolplane"))
 	assert.True(t, conf.IsSet("service::pipelines::logs/default_self_metrics"))
 	assert.True(t, conf.IsSet("service::pipelines::metrics/default_self_metrics"))
 
@@ -188,7 +233,7 @@ var _ googlepolicy.SourcePolicy = (*mockSourcePolicy)(nil)
 func TestRetrieve_NoFleetID(t *testing.T) {
 	t.Setenv("FLEET_ID", "")
 	p := createProvider()
-	_, err := p.Retrieve(context.Background(), "googlecontrolplane:component:my-config", nil)
+	_, err := retrieveForTest(t, p)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, selfmetrics.ErrNoFleetID)
 	assert.NoError(t, p.Shutdown(context.Background()))
@@ -288,7 +333,7 @@ func TestRetrieve_MultipleDestinationPolicies(t *testing.T) {
 		}
 	})
 
-	ret, err := p.Retrieve(context.Background(), "googlecontrolplane:component:my-config", nil)
+	ret, err := retrieveForTest(t, p)
 	require.NoError(t, err)
 	require.NotNil(t, ret)
 
@@ -332,7 +377,7 @@ func TestRetrieve_ActivePolicySetWithCustomDestination(t *testing.T) {
 		}
 	})
 
-	ret, err := p.Retrieve(context.Background(), "googlecontrolplane:component:my-config", nil)
+	ret, err := retrieveForTest(t, p)
 	require.NoError(t, err)
 	require.NotNil(t, ret)
 
@@ -367,7 +412,7 @@ func TestRetrieve_ActivePolicySetWithCustomSelfMetrics(t *testing.T) {
 		}
 	})
 
-	ret, err := p.Retrieve(context.Background(), "googlecontrolplane:component:my-config", nil)
+	ret, err := retrieveForTest(t, p)
 	require.NoError(t, err)
 	require.NotNil(t, ret)
 
@@ -398,15 +443,17 @@ func TestRetrieve_ActivePolicySetWithOtherSource(t *testing.T) {
 		}
 	})
 
-	ret, err := p.Retrieve(context.Background(), "googlecontrolplane:component:my-config", nil)
+	ret, err := retrieveForTest(t, p)
 	require.NoError(t, err)
 	require.NotNil(t, ret)
 
 	conf, err := ret.AsConf()
 	require.NoError(t, err)
 	assert.True(t, conf.IsSet("receivers::otlp/other_source"))
-	// Customer source pipelines MUST include googlepolicy processor
-	assert.Contains(t, conf.Get("service::pipelines::logs/other_source::processors"), "googlepolicy")
+	// Customer source pipelines are merged into the canonical logs/googlecontrolplane pipeline
+	// and MUST include googlepolicy processor.
+	assert.Equal(t, []any{"nop/googlecontrolplane", "otlp/other_source"}, conf.Get("service::pipelines::logs/googlecontrolplane::receivers"))
+	assert.Contains(t, conf.Get("service::pipelines::logs/googlecontrolplane::processors"), "googlepolicy")
 	// Built-in self metrics should also be added, but MUST bypass googlepolicy processor
 	assert.True(t, conf.IsSet("receivers::otlp/default_self_metrics"))
 	assert.NotContains(t, conf.Get("service::pipelines::logs/default_self_metrics::processors"), "googlepolicy")
@@ -560,7 +607,7 @@ func TestRetrieve_RecordsPolicyEvaluateErrorEventOnFailure(t *testing.T) {
 		}
 	})
 
-	ret, err := p.Retrieve(context.Background(), "googlecontrolplane:component:my-config", nil)
+	ret, err := retrieveForTest(t, p)
 	require.NoError(t, err)
 	require.NotNil(t, ret)
 
@@ -613,7 +660,7 @@ func TestRetrieve_BuiltinPolicyErrorDoesNotRollbackActivePolicySet(t *testing.T)
 		}
 	})
 
-	_, err := p.Retrieve(context.Background(), "googlecontrolplane:component:my-config", nil)
+	_, err := retrieveForTest(t, p)
 	require.ErrorIs(t, err, selfmetrics.ErrNoFleetID)
 
 	// Built-in policy failures must NOT roll back the active policy set or attribute the error to activePolicySet.RevisionID.

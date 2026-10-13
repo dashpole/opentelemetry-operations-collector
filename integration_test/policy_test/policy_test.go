@@ -42,6 +42,7 @@ import (
 	"go.opentelemetry.io/collector/confmap/provider/envprovider"
 	"go.opentelemetry.io/collector/confmap/provider/fileprovider"
 	"go.opentelemetry.io/collector/confmap/provider/yamlprovider"
+	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/nopexporter"
 	"go.opentelemetry.io/collector/exporter/otlpexporter"
@@ -456,10 +457,67 @@ func newStubExporterFactory(typeStr string) exporter.Factory {
 	)
 }
 
+type stubProcessor struct {
+	stubExtension
+	nextLogs    consumer.Logs
+	nextMetrics consumer.Metrics
+	nextTraces  consumer.Traces
+}
+
+func (s *stubProcessor) Capabilities() consumer.Capabilities {
+	return consumer.Capabilities{MutatesData: false}
+}
+
+func (s *stubProcessor) ConsumeLogs(ctx context.Context, ld plog.Logs) error {
+	if s.nextLogs != nil {
+		return s.nextLogs.ConsumeLogs(ctx, ld)
+	}
+	return nil
+}
+
+func (s *stubProcessor) ConsumeMetrics(ctx context.Context, md pmetric.Metrics) error {
+	if s.nextMetrics != nil {
+		return s.nextMetrics.ConsumeMetrics(ctx, md)
+	}
+	return nil
+}
+
+func (s *stubProcessor) ConsumeTraces(ctx context.Context, td ptrace.Traces) error {
+	if s.nextTraces != nil {
+		return s.nextTraces.ConsumeTraces(ctx, td)
+	}
+	return nil
+}
+
+func newStubReceiverFactory(typeStr string) receiver.Factory {
+	return receiver.NewFactory(
+		component.MustNewType(typeStr),
+		func() component.Config { return &stubComponentConfig{} },
+		receiver.WithLogs(func(context.Context, receiver.Settings, component.Config, consumer.Logs) (receiver.Logs, error) {
+			return &stubExtension{}, nil
+		}, component.StabilityLevelAlpha),
+		receiver.WithMetrics(func(context.Context, receiver.Settings, component.Config, consumer.Metrics) (receiver.Metrics, error) {
+			return &stubExtension{}, nil
+		}, component.StabilityLevelAlpha),
+		receiver.WithTraces(func(context.Context, receiver.Settings, component.Config, consumer.Traces) (receiver.Traces, error) {
+			return &stubExtension{}, nil
+		}, component.StabilityLevelAlpha),
+	)
+}
+
 func newStubProcessorFactory(typeStr string) processor.Factory {
 	return processor.NewFactory(
 		component.MustNewType(typeStr),
 		func() component.Config { return &stubComponentConfig{} },
+		processor.WithLogs(func(_ context.Context, _ processor.Settings, _ component.Config, next consumer.Logs) (processor.Logs, error) {
+			return &stubProcessor{nextLogs: next}, nil
+		}, component.StabilityLevelAlpha),
+		processor.WithMetrics(func(_ context.Context, _ processor.Settings, _ component.Config, next consumer.Metrics) (processor.Metrics, error) {
+			return &stubProcessor{nextMetrics: next}, nil
+		}, component.StabilityLevelAlpha),
+		processor.WithTraces(func(_ context.Context, _ processor.Settings, _ component.Config, next consumer.Traces) (processor.Traces, error) {
+			return &stubProcessor{nextTraces: next}, nil
+		}, component.StabilityLevelAlpha),
 	)
 }
 
@@ -478,6 +536,7 @@ func testCollectorFactories() (otelcol.Factories, error) {
 
 	factories.Receivers, err = otelcol.MakeFactoryMap[receiver.Factory](
 		otlpreceiver.NewFactory(),
+		newStubReceiverFactory("nop"),
 	)
 	if err != nil {
 		return otelcol.Factories{}, err
