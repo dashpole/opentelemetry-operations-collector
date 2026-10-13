@@ -15,7 +15,10 @@
 package googlepolicyprocessor
 
 import (
+	"cmp"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/pkg/googlepolicy"
 )
@@ -25,6 +28,7 @@ import (
 // only walks the pdata trees and applies the KEEP/DROP outcomes they return.
 type Evaluator struct {
 	logPolicies                []googlepolicy.LogPolicyEvaluator
+	logTransformPolicies       []googlepolicy.LogPolicyTransformer
 	metricPolicies             []googlepolicy.MetricPolicyEvaluator
 	instrumentMetricPolicies   []googlepolicy.MetricPolicyEvaluator
 	datapointMetricPolicies    []googlepolicy.MetricPolicyEvaluator
@@ -48,6 +52,8 @@ func NewEvaluator(policies []googlepolicy.TransformationPolicy) (*Evaluator, err
 		switch p := tp.(type) {
 		case googlepolicy.LogPolicyEvaluator:
 			ev.addLogPolicy(p)
+		case googlepolicy.LogPolicyTransformer:
+			ev.addLogTransformPolicy(p)
 		case googlepolicy.MetricPolicyEvaluator:
 			ev.addMetricPolicy(p)
 		case googlepolicy.TracePolicyEvaluator:
@@ -55,16 +61,28 @@ func NewEvaluator(policies []googlepolicy.TransformationPolicy) (*Evaluator, err
 		default:
 			return nil, fmt.Errorf(
 				"transformation policy %q (%T) implements none of googlepolicy.LogPolicyEvaluator, "+
-					"googlepolicy.MetricPolicyEvaluator or googlepolicy.TracePolicyEvaluator: "+
-					"transformation policies must implement one of them",
+					"googlepolicy.LogPolicyTransformer, googlepolicy.MetricPolicyEvaluator or "+
+					"googlepolicy.TracePolicyEvaluator: transformation policies must implement one of them",
 				tp.PolicyName(), tp)
 		}
 	}
+
+	slices.SortFunc(ev.logTransformPolicies, func(a, b googlepolicy.LogPolicyTransformer) int {
+		if a.Stage() != b.Stage() {
+			return cmp.Compare(a.Stage(), b.Stage())
+		}
+		return strings.Compare(a.PolicyName(), b.PolicyName())
+	})
+
 	return ev, nil
 }
 
 func (e *Evaluator) addLogPolicy(p googlepolicy.LogPolicyEvaluator) {
 	e.logPolicies = append(e.logPolicies, p)
+}
+
+func (e *Evaluator) addLogTransformPolicy(p googlepolicy.LogPolicyTransformer) {
+	e.logTransformPolicies = append(e.logTransformPolicies, p)
 }
 
 func (e *Evaluator) addMetricPolicy(p googlepolicy.MetricPolicyEvaluator) {

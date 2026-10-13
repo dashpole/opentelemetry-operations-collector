@@ -120,6 +120,12 @@ message LogFieldSelector {
 
     // Standard first-class OpenTelemetry InstrumentationScope fields (e.g. name, version).
     ScopeField scope_field = 5;
+
+    // Traverses nested fields inside a structured (kvlist_value / map)
+    // LogRecord.body (e.g. ["event_id"], ["event_data", "TargetUserName"]).
+    // Evaluates to false (non-matching) if LogRecord.body is not a structured
+    // map or if the path does not exist.
+    AttributePath body_field = 6;
   }
 }
 

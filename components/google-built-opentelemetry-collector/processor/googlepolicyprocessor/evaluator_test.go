@@ -20,6 +20,7 @@ import (
 	policyv1alpha1 "github.com/GoogleCloudPlatform/opentelemetry-operations-collector/gen/go/policy/v1alpha1"
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/pkg/googlepolicy"
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/pkg/googlepolicy/logfilter"
+	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/pkg/googlepolicy/logtransform"
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/pkg/googlepolicy/metricfilter"
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/pkg/googlepolicy/tracefilter"
 	"github.com/stretchr/testify/assert"
@@ -1012,6 +1013,10 @@ func mustPolicy(t *testing.T, pb proto.Message) googlepolicy.TransformationPolic
 		pol, err := logfilter.NewPolicyFromProto(p)
 		require.NoError(t, err)
 		return pol
+	case *policyv1alpha1.LogTransformPolicy:
+		pol, err := logtransform.NewPolicyFromProto(p)
+		require.NoError(t, err)
+		return pol
 	case *policyv1alpha1.MetricFilterPolicy:
 		pol, err := metricfilter.NewPolicyFromProto(p)
 		require.NoError(t, err)
@@ -1167,4 +1172,174 @@ func metricNames(md pmetric.Metrics) []string {
 		}
 	}
 	return names
+}
+
+func TestEvaluator_LogTransformStageOrderingAndDoubleFilter(t *testing.T) {
+	strPtr := func(s string) *string { return &s }
+	boolPtr := func(b bool) *bool { return &b }
+
+	// Provide policies in deliberately scrambled order (redact, remove, add, rename)
+	// to prove that NewEvaluator enforces rename -> add -> remove -> redact
+	// with lexicographical ID tie-breaking and Double-Applied Filtering.
+	redactPol := mustPolicy(t, &policyv1alpha1.LogTransformPolicy{
+		Id: "z-redact-secret",
+		Action: &policyv1alpha1.LogTransformPolicy_Redact{
+			Redact: &policyv1alpha1.LogRedactAction{
+				Target: &policyv1alpha1.LogFieldSelector{
+					Target: &policyv1alpha1.LogFieldSelector_LogAttribute{
+						LogAttribute: &policyv1alpha1.AttributePath{Path: []string{"user.id"}},
+					},
+				},
+				Regex:       strPtr(`secret-[0-9]+`),
+				Replacement: strPtr("[REDACTED]"),
+			},
+		},
+	})
+
+	removeRI := mustPolicy(t, &policyv1alpha1.LogTransformPolicy{
+		Id: "b-remove-rendering-info",
+		Action: &policyv1alpha1.LogTransformPolicy_Remove{
+			Remove: &policyv1alpha1.LogRemoveAction{
+				Target: &policyv1alpha1.LogFieldSelector{
+					Target: &policyv1alpha1.LogFieldSelector_BodyField{
+						BodyField: &policyv1alpha1.AttributePath{Path: []string{"rendering_info"}},
+					},
+				},
+			},
+		},
+	})
+
+	addFallback := mustPolicy(t, &policyv1alpha1.LogTransformPolicy{
+		Id: "a-add-fallback-user",
+		Action: &policyv1alpha1.LogTransformPolicy_Add{
+			Add: &policyv1alpha1.LogAddAction{
+				Target: &policyv1alpha1.LogFieldSelector{
+					Target: &policyv1alpha1.LogFieldSelector_LogAttribute{
+						LogAttribute: &policyv1alpha1.AttributePath{Path: []string{"user.id"}},
+					},
+				},
+				Value:  &policyv1alpha1.Value{Value: &policyv1alpha1.Value_StringValue{StringValue: "fallback"}},
+				Upsert: boolPtr(false),
+			},
+		},
+	})
+
+	// Same-stage lexicographical tie-breaking: b-add-tier is supplied before a-add-tier,
+	// both with upsert: false on attribute "tier". Because a-add-tier < b-add-tier
+	// lexicographically, a-add-tier ("gold") must run first and b-add-tier ("silver")
+	// must be skipped.
+	addTierB := mustPolicy(t, &policyv1alpha1.LogTransformPolicy{
+		Id: "b-add-tier",
+		Action: &policyv1alpha1.LogTransformPolicy_Add{
+			Add: &policyv1alpha1.LogAddAction{
+				Target: &policyv1alpha1.LogFieldSelector{
+					Target: &policyv1alpha1.LogFieldSelector_LogAttribute{
+						LogAttribute: &policyv1alpha1.AttributePath{Path: []string{"tier"}},
+					},
+				},
+				Value:  &policyv1alpha1.Value{Value: &policyv1alpha1.Value_StringValue{StringValue: "silver"}},
+				Upsert: boolPtr(false),
+			},
+		},
+	})
+
+	addTierA := mustPolicy(t, &policyv1alpha1.LogTransformPolicy{
+		Id: "a-add-tier",
+		Action: &policyv1alpha1.LogTransformPolicy_Add{
+			Add: &policyv1alpha1.LogAddAction{
+				Target: &policyv1alpha1.LogFieldSelector{
+					Target: &policyv1alpha1.LogFieldSelector_LogAttribute{
+						LogAttribute: &policyv1alpha1.AttributePath{Path: []string{"tier"}},
+					},
+				},
+				Value:  &policyv1alpha1.Value{Value: &policyv1alpha1.Value_StringValue{StringValue: "gold"}},
+				Upsert: boolPtr(false),
+			},
+		},
+	})
+
+	renameLegacy := mustPolicy(t, &policyv1alpha1.LogTransformPolicy{
+		Id: "m-rename-legacy-user",
+		Action: &policyv1alpha1.LogTransformPolicy_Rename{
+			Rename: &policyv1alpha1.LogRenameAction{
+				From: &policyv1alpha1.LogFieldSelector{
+					Target: &policyv1alpha1.LogFieldSelector_LogAttribute{
+						LogAttribute: &policyv1alpha1.AttributePath{Path: []string{"legacy_user_id"}},
+					},
+				},
+				To: &policyv1alpha1.LogFieldSelector{
+					Target: &policyv1alpha1.LogFieldSelector_LogAttribute{
+						LogAttribute: &policyv1alpha1.AttributePath{Path: []string{"user.id"}},
+					},
+				},
+			},
+		},
+	})
+
+	// Pass 2 Filter: Drop if user.id == "drop-after-rename"
+	dropRenamedUser := mustPolicy(t, &policyv1alpha1.LogFilterPolicy{
+		Id:     "filter-drop-renamed",
+		Action: policyv1alpha1.Action_ACTION_DROP.Enum(),
+		Matches: []*policyv1alpha1.LogMatcher{
+			{
+				Target: &policyv1alpha1.LogFieldSelector{
+					Target: &policyv1alpha1.LogFieldSelector_LogAttribute{
+						LogAttribute: &policyv1alpha1.AttributePath{Path: []string{"user.id"}},
+					},
+				},
+				Predicate: &policyv1alpha1.LogMatcher_Equals{
+					Equals: &policyv1alpha1.Value{Value: &policyv1alpha1.Value_StringValue{StringValue: "drop-after-rename"}},
+				},
+			},
+		},
+	})
+
+	ev, err := NewEvaluator([]googlepolicy.TransformationPolicy{
+		redactPol, removeRI, addTierB, addFallback, addTierA, renameLegacy, dropRenamedUser,
+	})
+	require.NoError(t, err)
+
+	ld := plog.NewLogs()
+	sl := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
+
+	// Record 0: already has user.id == "drop-after-rename" before any transform runs ->
+	// dropped immediately in Pass 1 Pre-Transform filter.
+	lr0 := sl.LogRecords().AppendEmpty()
+	lr0.Attributes().PutStr("user.id", "drop-after-rename")
+
+	// Record 1: has legacy_user_id = "user-secret-123" and body.rendering_info
+	// Expected:
+	// 1. rename moves legacy_user_id -> user.id ("user-secret-123")
+	// 2. add ("a-add-fallback-user") with upsert: false sees user.id already exists and skips "fallback";
+	//    "a-add-tier" runs before "b-add-tier" and sets tier = "gold"
+	// 3. remove deletes body.rendering_info
+	// 4. redact masks "secret-123" -> "user-[REDACTED]" on the renamed user.id!
+	lr1 := sl.LogRecords().AppendEmpty()
+	lr1.Attributes().PutStr("legacy_user_id", "user-secret-123")
+	bm1 := lr1.Body().SetEmptyMap()
+	bm1.PutEmptyMap("event_id").PutInt("id", 4624)
+	bm1.PutEmptyMap("rendering_info").PutStr("message", "German prose")
+
+	// Record 2: has legacy_user_id = "drop-after-rename"
+	// Expected: Pass 1 filter does not drop it, rename moves legacy_user_id -> user.id,
+	// and Pass 2 Post-Transform filter drops it!
+	lr2 := sl.LogRecords().AppendEmpty()
+	lr2.Attributes().PutStr("legacy_user_id", "drop-after-rename")
+
+	ev.TransformLogs(ld)
+
+	records := ld.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords()
+	require.Equal(t, 1, records.Len(), "Record 0 (Pass 1) and Record 2 (Pass 2) must be dropped")
+
+	surviving := records.At(0)
+	uid, ok := surviving.Attributes().Get("user.id")
+	require.True(t, ok)
+	assert.Equal(t, "user-[REDACTED]", uid.Str())
+	tier, ok := surviving.Attributes().Get("tier")
+	require.True(t, ok)
+	assert.Equal(t, "gold", tier.Str(), "a-add-tier must win over b-add-tier via lexicographical tie-breaking")
+	_, hasRI := surviving.Body().Map().Get("rendering_info")
+	assert.False(t, hasRI)
+	_, hasEventID := surviving.Body().Map().Get("event_id")
+	assert.True(t, hasEventID)
 }

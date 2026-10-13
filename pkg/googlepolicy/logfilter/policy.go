@@ -67,7 +67,7 @@ var (
 // Policy represents a compiled, validated LogFilterPolicy ready for hot-loop evaluation.
 type Policy struct {
 	proto    *policyv1alpha1.LogFilterPolicy
-	matchers []compiledMatcher
+	matchers []CompiledMatcher
 }
 
 var _ googlepolicy.TransformationPolicy = (*Policy)(nil)
@@ -92,9 +92,9 @@ func NewPolicyFromProto(pb *policyv1alpha1.LogFilterPolicy) (*Policy, error) {
 		return nil, ErrMissingMatchers
 	}
 
-	matchers := make([]compiledMatcher, 0, len(pb.GetMatches()))
+	matchers := make([]CompiledMatcher, 0, len(pb.GetMatches()))
 	for i, m := range pb.GetMatches() {
-		cm, err := compileMatcher(m)
+		cm, err := CompileMatcher(m)
 		if err != nil {
 			return nil, fmt.Errorf("matcher[%d]: %w", i, err)
 		}
@@ -165,7 +165,7 @@ func (p *Policy) EvaluateLog(ctx googlepolicy.LogContext) googlepolicy.EvalResul
 // LogContext. Matchers are AND-ed.
 func (p *Policy) matchesContext(ctx googlepolicy.LogContext) bool {
 	for i := range p.matchers {
-		if !p.matchers[i].eval(ctx) {
+		if !p.matchers[i].Eval(ctx) {
 			return false
 		}
 	}
@@ -175,25 +175,28 @@ func (p *Policy) matchesContext(ctx googlepolicy.LogContext) bool {
 // targetExtractor pulls the value a matcher targets out of a LogContext.
 type targetExtractor func(ctx googlepolicy.LogContext) (val any, exists bool)
 
-type compiledMatcher struct {
+// CompiledMatcher is a compiled LogMatcher predicate ready for evaluation against a LogContext.
+type CompiledMatcher struct {
 	extract   targetExtractor
 	predicate matcher.Predicate
 }
 
-func (cm *compiledMatcher) eval(ctx googlepolicy.LogContext) bool {
+// Eval evaluates the compiled matcher against ctx.
+func (cm *CompiledMatcher) Eval(ctx googlepolicy.LogContext) bool {
 	return cm.predicate(cm.extract(ctx))
 }
 
-func compileMatcher(m *policyv1alpha1.LogMatcher) (compiledMatcher, error) {
+// CompileMatcher compiles a protobuf LogMatcher into a CompiledMatcher.
+func CompileMatcher(m *policyv1alpha1.LogMatcher) (CompiledMatcher, error) {
 	extract, err := compileExtractor(m.GetTarget())
 	if err != nil {
-		return compiledMatcher{}, err
+		return CompiledMatcher{}, err
 	}
 	predicate, err := matcher.CompilePredicate(m.GetPredicate(), m.GetNegate())
 	if err != nil {
-		return compiledMatcher{}, err
+		return CompiledMatcher{}, err
 	}
-	return compiledMatcher{extract: extract, predicate: predicate}, nil
+	return CompiledMatcher{extract: extract, predicate: predicate}, nil
 }
 
 func compileExtractor(target *policyv1alpha1.LogFieldSelector) (targetExtractor, error) {
@@ -243,6 +246,18 @@ func compileExtractor(target *policyv1alpha1.LogFieldSelector) (targetExtractor,
 
 	case *policyv1alpha1.LogFieldSelector_ScopeField:
 		return compileScopeFieldExtractor(t.ScopeField)
+
+	case *policyv1alpha1.LogFieldSelector_BodyField:
+		steps, err := matcher.CompilePath(t.BodyField, "body")
+		if err != nil {
+			return nil, err
+		}
+		return func(ctx googlepolicy.LogContext) (any, bool) {
+			if ctx.Record == (plog.LogRecord{}) || ctx.Record.Body().Type() != pcommon.ValueTypeMap {
+				return nil, false
+			}
+			return matcher.EvalPath(ctx.Record.Body().Map(), steps)
+		}, nil
 
 	default:
 		return nil, ErrMissingTarget

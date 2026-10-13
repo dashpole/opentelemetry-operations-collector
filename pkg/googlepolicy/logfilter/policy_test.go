@@ -1730,3 +1730,36 @@ func TestDriverRoutesItsProto(t *testing.T) {
 	require.True(t, ok, "no policy type is registered for %s, so log filter policies cannot be routed", protoName)
 	assert.Equal(t, PolicyType, got)
 }
+
+func TestBodyFieldMatcher(t *testing.T) {
+	pb := &policyv1alpha1.LogFilterPolicy{
+		Id:     "match-wef-event-4624",
+		Action: policyv1alpha1.Action_ACTION_DROP.Enum(),
+		Matches: []*policyv1alpha1.LogMatcher{
+			{
+				Target: &policyv1alpha1.LogFieldSelector{
+					Target: &policyv1alpha1.LogFieldSelector_BodyField{
+						BodyField: &policyv1alpha1.AttributePath{Path: []string{"event_id", "id"}},
+					},
+				},
+				Predicate: &policyv1alpha1.LogMatcher_Equals{
+					Equals: &policyv1alpha1.Value{Value: &policyv1alpha1.Value_IntValue{IntValue: 4624}},
+				},
+			},
+		},
+	}
+
+	pol, err := NewPolicyFromProto(pb)
+	require.NoError(t, err)
+
+	// Structured body with event_id.id = 4624 matches
+	lr, sl, rl := newTestLogBundle()
+	bm := lr.Body().SetEmptyMap()
+	bm.PutEmptyMap("event_id").PutInt("id", 4624)
+	assert.Equal(t, googlepolicy.EvalDrop, pol.EvaluateLog(logContext(lr, sl, rl)))
+
+	// String body evaluates to EvalNoMatch (fail-open)
+	lrStr, slStr, rlStr := newTestLogBundle()
+	lrStr.Body().SetStr("<Event><System><EventID>4624</EventID></System></Event>")
+	assert.Equal(t, googlepolicy.EvalNoMatch, pol.EvaluateLog(logContext(lrStr, slStr, rlStr)))
+}

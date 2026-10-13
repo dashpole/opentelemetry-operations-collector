@@ -22,7 +22,7 @@ import (
 // TransformLogs applies active transformation policies in-place across the Resource -> Scope -> Record hierarchy.
 // Dropped records are pruned, and empty scopes/resources are removed.
 func (e *Evaluator) TransformLogs(ld plog.Logs) {
-	if len(e.logPolicies) == 0 {
+	if len(e.logPolicies) == 0 && len(e.logTransformPolicies) == 0 {
 		return
 	}
 
@@ -53,8 +53,32 @@ func (e *Evaluator) TransformLogs(ld plog.Logs) {
 }
 
 // EvalLog returns true if the log record should be DROPPED, false if KEPT.
-// A matching ACTION_KEEP policy exempts the record outright.
+// It executes Double-Applied Filtering around the deterministic Transform stage
+// sequence (Pass 1 Pre-Transform Filter -> rename -> add -> remove -> redact ->
+// Pass 2 Post-Transform Filter).
 func (e *Evaluator) EvalLog(ctx LogContext) bool {
+	if len(e.logPolicies) > 0 && e.evalLogFilters(ctx) {
+		return true
+	}
+
+	if len(e.logTransformPolicies) == 0 {
+		return false
+	}
+
+	var mutated bool
+	for _, tp := range e.logTransformPolicies {
+		if tp.TransformLog(ctx) {
+			mutated = true
+		}
+	}
+
+	if mutated && len(e.logPolicies) > 0 {
+		return e.evalLogFilters(ctx)
+	}
+	return false
+}
+
+func (e *Evaluator) evalLogFilters(ctx LogContext) bool {
 	var hasDrop bool
 	for _, p := range e.logPolicies {
 		switch p.EvaluateLog(ctx) {

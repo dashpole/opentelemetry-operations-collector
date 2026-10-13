@@ -100,6 +100,25 @@ type LogPolicyEvaluator interface {
 	EvaluateLog(ctx LogContext) EvalResult
 }
 
+// TransformStage represents the deterministic execution stage of a transform
+// policy: rename -> add -> remove -> redact.
+type TransformStage uint8
+
+const (
+	StageRename TransformStage = iota + 1
+	StageAdd
+	StageRemove
+	StageRedact
+)
+
+// LogPolicyTransformer is implemented by transformation policies that mutate
+// log records in place (e.g., LogTransformPolicy in pkg/googlepolicy/logtransform).
+type LogPolicyTransformer interface {
+	TransformationPolicy
+	Stage() TransformStage
+	TransformLog(ctx LogContext) bool
+}
+
 // MetricContext holds the contextual information needed to evaluate a single
 // metric datapoint. DatapointAttributes is empty when the policy set is
 // evaluated at instrument level only.

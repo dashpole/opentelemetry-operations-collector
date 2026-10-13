@@ -426,6 +426,7 @@ type LogFieldSelector struct {
 	//	*LogFieldSelector_ResourceAttribute
 	//	*LogFieldSelector_ScopeAttribute
 	//	*LogFieldSelector_ScopeField
+	//	*LogFieldSelector_BodyField
 	Target        isLogFieldSelector_Target `protobuf_oneof:"target"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -513,6 +514,15 @@ func (x *LogFieldSelector) GetScopeField() ScopeField {
 	return ScopeField_SCOPE_FIELD_UNSPECIFIED
 }
 
+func (x *LogFieldSelector) GetBodyField() *AttributePath {
+	if x != nil {
+		if x, ok := x.Target.(*LogFieldSelector_BodyField); ok {
+			return x.BodyField
+		}
+	}
+	return nil
+}
+
 type isLogFieldSelector_Target interface {
 	isLogFieldSelector_Target()
 }
@@ -542,6 +552,14 @@ type LogFieldSelector_ScopeField struct {
 	ScopeField ScopeField `protobuf:"varint,5,opt,name=scope_field,json=scopeField,proto3,enum=google.telemetry.policy.v1alpha1.ScopeField,oneof"`
 }
 
+type LogFieldSelector_BodyField struct {
+	// Traverses nested fields inside a structured (kvlist_value / map)
+	// LogRecord.body (e.g. ["event_id"], ["event_data", "TargetUserName"]).
+	// Evaluates to false (non-matching) if LogRecord.body is not a structured
+	// map or if the path does not exist.
+	BodyField *AttributePath `protobuf:"bytes,6,opt,name=body_field,json=bodyField,proto3,oneof"`
+}
+
 func (*LogFieldSelector_RecordField) isLogFieldSelector_Target() {}
 
 func (*LogFieldSelector_LogAttribute) isLogFieldSelector_Target() {}
@@ -551,6 +569,8 @@ func (*LogFieldSelector_ResourceAttribute) isLogFieldSelector_Target() {}
 func (*LogFieldSelector_ScopeAttribute) isLogFieldSelector_Target() {}
 
 func (*LogFieldSelector_ScopeField) isLogFieldSelector_Target() {}
+
+func (*LogFieldSelector_BodyField) isLogFieldSelector_Target() {}
 
 var File_policy_v1alpha1_log_filter_policy_proto protoreflect.FileDescriptor
 
@@ -575,14 +595,16 @@ const file_policy_v1alpha1_log_filter_policy_proto_rawDesc = "" +
 	"\x03lte\x18\x10 \x01(\v2..google.telemetry.policy.v1alpha1.NumericValueH\x00R\x03lte\x12E\n" +
 	"\bcontains\x18\x11 \x01(\v2'.google.telemetry.policy.v1alpha1.ValueH\x00R\bcontains\x12\x16\n" +
 	"\x06negate\x18\x02 \x01(\bR\x06negateB\v\n" +
-	"\tpredicate\"\xda\x03\n" +
+	"\tpredicate\"\xac\x04\n" +
 	"\x10LogFieldSelector\x12U\n" +
 	"\frecord_field\x18\x01 \x01(\x0e20.google.telemetry.policy.v1alpha1.LogRecordFieldH\x00R\vrecordField\x12V\n" +
 	"\rlog_attribute\x18\x02 \x01(\v2/.google.telemetry.policy.v1alpha1.AttributePathH\x00R\flogAttribute\x12`\n" +
 	"\x12resource_attribute\x18\x03 \x01(\v2/.google.telemetry.policy.v1alpha1.AttributePathH\x00R\x11resourceAttribute\x12Z\n" +
 	"\x0fscope_attribute\x18\x04 \x01(\v2/.google.telemetry.policy.v1alpha1.AttributePathH\x00R\x0escopeAttribute\x12O\n" +
 	"\vscope_field\x18\x05 \x01(\x0e2,.google.telemetry.policy.v1alpha1.ScopeFieldH\x00R\n" +
-	"scopeFieldB\b\n" +
+	"scopeField\x12P\n" +
+	"\n" +
+	"body_field\x18\x06 \x01(\v2/.google.telemetry.policy.v1alpha1.AttributePathH\x00R\tbodyFieldB\b\n" +
 	"\x06target*\xd4\x01\n" +
 	"\x0eLogRecordField\x12 \n" +
 	"\x1cLOG_RECORD_FIELD_UNSPECIFIED\x10\x00\x12\x19\n" +
@@ -635,11 +657,12 @@ var file_policy_v1alpha1_log_filter_policy_proto_depIdxs = []int32{
 	8,  // 12: google.telemetry.policy.v1alpha1.LogFieldSelector.resource_attribute:type_name -> google.telemetry.policy.v1alpha1.AttributePath
 	8,  // 13: google.telemetry.policy.v1alpha1.LogFieldSelector.scope_attribute:type_name -> google.telemetry.policy.v1alpha1.AttributePath
 	9,  // 14: google.telemetry.policy.v1alpha1.LogFieldSelector.scope_field:type_name -> google.telemetry.policy.v1alpha1.ScopeField
-	15, // [15:15] is the sub-list for method output_type
-	15, // [15:15] is the sub-list for method input_type
-	15, // [15:15] is the sub-list for extension type_name
-	15, // [15:15] is the sub-list for extension extendee
-	0,  // [0:15] is the sub-list for field type_name
+	8,  // 15: google.telemetry.policy.v1alpha1.LogFieldSelector.body_field:type_name -> google.telemetry.policy.v1alpha1.AttributePath
+	16, // [16:16] is the sub-list for method output_type
+	16, // [16:16] is the sub-list for method input_type
+	16, // [16:16] is the sub-list for extension type_name
+	16, // [16:16] is the sub-list for extension extendee
+	0,  // [0:16] is the sub-list for field type_name
 }
 
 func init() { file_policy_v1alpha1_log_filter_policy_proto_init() }
@@ -665,6 +688,7 @@ func file_policy_v1alpha1_log_filter_policy_proto_init() {
 		(*LogFieldSelector_ResourceAttribute)(nil),
 		(*LogFieldSelector_ScopeAttribute)(nil),
 		(*LogFieldSelector_ScopeField)(nil),
+		(*LogFieldSelector_BodyField)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
