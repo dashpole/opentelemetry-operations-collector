@@ -118,45 +118,92 @@ func (p *GCPDestinationPolicy) Evaluate(_ context.Context) (*confmap.Conf, error
 	// unmarshal once the component settled on "queuebatch".
 	queueBatchType := queuebatchprocessor.NewFactory().Type()
 
-	queueBatchLog := queuebatchprocessor.NewFactory().CreateDefaultConfig().(*queuebatchprocessor.Config)
-	batchSubconfig := queueBatchLog.Batch.GetOrInsertDefault()
-	batchSubconfig.MaxSize = 8192
-	batchSubconfig.MinSize = 8192
+	const (
+		stage1QueueSizeBytes = 32 * 1024 * 1024      // 32 MiB (33,554,432 B)
+		stage1MinBatchBytes  = 7 * 1024 * 1024 / 2   // 3.5 MiB (3,670,016 B)
+		stage1MaxBatchBytes  = 4 * 1024 * 1024       // 4 MiB (4,194,304 B), leaving 1 MiB headroom below UTR's 5 MiB limit
+		utrMaxLogItems       = 8192                  // UTR kMaxLogCountPerBatch
+		utrMaxMetricItems    = 200                   // UTR kMaxPointsPerRequest
+		utrMaxTraceItems     = 8192                  // UTR kMaxSpanCountPerBatch (#710)
+	)
+
+	newStage1ByteBatchConfig := func() *queuebatchprocessor.Config {
+		cfg := queuebatchprocessor.NewFactory().CreateDefaultConfig().(*queuebatchprocessor.Config)
+		cfg.Sizer = exporterhelper.RequestSizerTypeBytes
+		cfg.QueueSize = stage1QueueSizeBytes
+		batchCfg := cfg.Batch.GetOrInsertDefault()
+		batchCfg.Sizer = exporterhelper.RequestSizerTypeBytes
+		batchCfg.MinSize = stage1MinBatchBytes
+		batchCfg.MaxSize = stage1MaxBatchBytes
+		return cfg
+	}
+
+	newStage2ItemSplitConfig := func(maxItems int64) *queuebatchprocessor.Config {
+		cfg := queuebatchprocessor.NewFactory().CreateDefaultConfig().(*queuebatchprocessor.Config)
+		cfg.Sizer = exporterhelper.RequestSizerTypeRequests
+		batchCfg := cfg.Batch.GetOrInsertDefault()
+		batchCfg.Sizer = exporterhelper.RequestSizerTypeItems
+		batchCfg.MinSize = 0
+		batchCfg.MaxSize = maxItems
+		return cfg
+	}
+
 	queueBatchLogsID := component.NewIDWithName(queueBatchType, fmt.Sprintf("%s_batch_logs", p.Name))
+	queueSplitLogsID := component.NewIDWithName(queueBatchType, fmt.Sprintf("%s_split_logs", p.Name))
 
-	queueBatchMetric := queuebatchprocessor.NewFactory().CreateDefaultConfig().(*queuebatchprocessor.Config)
-	batchSubconfig = queueBatchMetric.Batch.GetOrInsertDefault()
-	batchSubconfig.MaxSize = 200
-	batchSubconfig.MinSize = 200
 	queueBatchMetricsID := component.NewIDWithName(queueBatchType, fmt.Sprintf("%s_batch_metrics", p.Name))
+	queueSplitMetricsID := component.NewIDWithName(queueBatchType, fmt.Sprintf("%s_split_metrics", p.Name))
 
-	queueBatchTrace := queuebatchprocessor.NewFactory().CreateDefaultConfig().(*queuebatchprocessor.Config)
-	batchSubconfig = queueBatchTrace.Batch.GetOrInsertDefault()
-	batchSubconfig.MaxSize = 25000
-	batchSubconfig.MinSize = 25000
 	queueBatchTracesID := component.NewIDWithName(queueBatchType, fmt.Sprintf("%s_batch_traces", p.Name))
+	queueSplitTracesID := component.NewIDWithName(queueBatchType, fmt.Sprintf("%s_split_traces", p.Name))
 
 	conf.Processors = map[component.ID]component.Config{
-		queueBatchLogsID:    component.Config(queueBatchLog),
-		queueBatchMetricsID: component.Config(queueBatchMetric),
-		queueBatchTracesID:  component.Config(queueBatchTrace),
+		queueBatchLogsID:    component.Config(newStage1ByteBatchConfig()),
+		queueSplitLogsID:    component.Config(newStage2ItemSplitConfig(utrMaxLogItems)),
+		queueBatchMetricsID: component.Config(newStage1ByteBatchConfig()),
+		queueSplitMetricsID: component.Config(newStage2ItemSplitConfig(utrMaxMetricItems)),
+		queueBatchTracesID:  component.Config(newStage1ByteBatchConfig()),
+		queueSplitTracesID:  component.Config(newStage2ItemSplitConfig(utrMaxTraceItems)),
 	}
 
 	p.extensionIDs = []component.ID{authID}
 	p.exporterIDs = []component.ID{otlpExporterID}
-	p.preprocessorLogIDs = []component.ID{queueBatchLogsID}
-	p.preprocessorMetricIDs = []component.ID{queueBatchMetricsID}
-	p.preprocessorTraceIDs = []component.ID{queueBatchTracesID}
+	p.preprocessorLogIDs = []component.ID{queueBatchLogsID, queueSplitLogsID}
+	p.preprocessorMetricIDs = []component.ID{queueBatchMetricsID, queueSplitMetricsID}
+	p.preprocessorTraceIDs = []component.ID{queueBatchTracesID, queueSplitTracesID}
 
 	cm := confmap.New()
 	if err := cm.Marshal(conf); err != nil {
 		return nil, fmt.Errorf("policy implementation failure for %s: marshaling config got error '%w'", p.PolicyName(), err)
 	}
 
+	// Work around opentelemetry-operations-collector#711: exporterhelper.RequestSizerType
+	// defines MarshalText on a pointer receiver (*SizerType) and holds an unexported field,
+	// so confmap.Conf.Marshal serializes value fields of type RequestSizerType as an empty
+	// map (`sizer: {}`). Explicitly write the string sizer representations so the generated
+	// confmap can be unmarshaled by queuebatchprocessor.
+	processorSizers := map[string]any{}
+	for _, id := range []component.ID{queueBatchLogsID, queueBatchMetricsID, queueBatchTracesID} {
+		processorSizers[id.String()] = map[string]any{
+			"sizer": exporterhelper.RequestSizerTypeBytes.String(),
+			"batch": map[string]any{
+				"sizer": exporterhelper.RequestSizerTypeBytes.String(),
+			},
+		}
+	}
+	for _, id := range []component.ID{queueSplitLogsID, queueSplitMetricsID, queueSplitTracesID} {
+		processorSizers[id.String()] = map[string]any{
+			"sizer": exporterhelper.RequestSizerTypeRequests.String(),
+			"batch": map[string]any{
+				"sizer": exporterhelper.RequestSizerTypeItems.String(),
+			},
+		}
+	}
+
 	// See the QueueConfig comment above. configoptional reads `enabled` on
 	// unmarshal and turns the section into None, but it never writes that key
 	// on marshal, so the disable has to be added to the generated config here.
-	disableSendingQueue := confmap.NewFromStringMap(map[string]any{
+	postMarshalOverrides := confmap.NewFromStringMap(map[string]any{
 		"exporters": map[string]any{
 			otlpExporterID.String(): map[string]any{
 				"sending_queue": map[string]any{
@@ -164,9 +211,10 @@ func (p *GCPDestinationPolicy) Evaluate(_ context.Context) (*confmap.Conf, error
 				},
 			},
 		},
+		"processors": processorSizers,
 	})
-	if err := cm.Merge(disableSendingQueue); err != nil {
-		return nil, fmt.Errorf("policy implementation failure for %s: disabling exporter sending queue got error '%w'", p.PolicyName(), err)
+	if err := cm.Merge(postMarshalOverrides); err != nil {
+		return nil, fmt.Errorf("policy implementation failure for %s: applying post-marshal overrides got error '%w'", p.PolicyName(), err)
 	}
 
 	return cm, nil
