@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/provider/googlecontrolplaneprovider/policies/selfmetrics"
+	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/provider/googlecontrolplaneprovider/policies/windowseventlog"
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/pkg/event"
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/pkg/googlepolicy"
 	"github.com/stretchr/testify/assert"
@@ -415,6 +416,72 @@ func TestRetrieve_ActivePolicySetWithOtherSource(t *testing.T) {
 	assert.NoError(t, p.Shutdown(context.Background()))
 }
 
+func TestRetrieve_ActivePolicySetWithMultipleWindowsEventLogPolicies(t *testing.T) {
+	t.Setenv("FLEET_ID", "1234")
+	p := createProvider()
+
+	pol1 := &windowseventlog.WindowsEventLogSourcePolicy{
+		ID:       "01_dc_events",
+		Channels: []string{"Security", "Application", "security"},
+	}
+	pol2 := &windowseventlog.WindowsEventLogSourcePolicy{
+		ID:       "02_wec_events",
+		Channels: []string{"SECURITY", "System", "application"},
+	}
+
+	ps := &googlepolicy.PolicySet{
+		RevisionID: "rev-win-event-log",
+		Policies: map[string]*googlepolicy.PolicySetEntry{
+			pol1.PolicyName(): {PolicyObj: pol1},
+			pol2.PolicyName(): {PolicyObj: pol2},
+		},
+	}
+	googlepolicy.SetActivePolicySet(ps)
+	t.Cleanup(func() {
+		for googlepolicy.ActivePolicySet() != nil {
+			googlepolicy.RollbackActivePolicySet()
+		}
+	})
+
+	ret, err := p.Retrieve(context.Background(), "googlecontrolplane:component:my-config", nil)
+	require.NoError(t, err)
+	require.NotNil(t, ret)
+
+	conf, err := ret.AsConf()
+	require.NoError(t, err)
+
+	// Verify case-insensitive channel deduplication preserves first-seen casing
+	// ("Security", "Application", "System") and sets all 4 high-throughput defaults.
+	for prefix, wantChannel := range map[string]string{
+		"receivers::windowseventlog/security":    "Security",
+		"receivers::windowseventlog/application": "Application",
+		"receivers::windowseventlog/system":      "System",
+	} {
+		assert.Equal(t, wantChannel, conf.Get(prefix+"::channel"))
+		assert.Equal(t, true, conf.Get(prefix+"::suppress_rendering_info"))
+		assert.Equal(t, true, conf.Get(prefix+"::event_driven_scraping"))
+		assert.Equal(t, 500, conf.Get(prefix+"::max_reads"))
+		assert.Equal(t, true, conf.Get(prefix+"::ignore_channel_errors"))
+	}
+
+	// Verify the merged logs/windows_event_log pipeline includes all 3 deduplicated
+	// receivers once, plus the googlepolicy and destination batch processors.
+	assert.Equal(t, []any{
+		"windowseventlog/security",
+		"windowseventlog/application",
+		"windowseventlog/system",
+	}, conf.Get("service::pipelines::logs/windows_event_log::receivers"))
+	assert.Equal(t, []any{
+		"googlepolicy",
+		"queue_batch/default_gcp_destination_batch_logs",
+	}, conf.Get("service::pipelines::logs/windows_event_log::processors"))
+	assert.Equal(t, []any{
+		"otlp_grpc/default_gcp_destination",
+	}, conf.Get("service::pipelines::logs/windows_event_log::exporters"))
+
+	assert.NoError(t, p.Shutdown(context.Background()))
+}
+
 func TestFilterPolicyDriversRegistered(t *testing.T) {
 	// Verify that importing googlecontrolplaneprovider registers log_filter,
 	// metric_filter, and trace_filter policy drivers in googlepolicy.
@@ -462,6 +529,14 @@ func TestFilterPolicyDriversRegistered(t *testing.T) {
 						"exists": map[string]any{},
 					},
 				},
+			},
+		},
+		{
+			policyType: "windows_event_log",
+			raw: map[string]any{
+				"type":     "windows_event_log",
+				"id":       "test-winevt",
+				"channels": []any{"Security", "System"},
 			},
 		},
 	} {

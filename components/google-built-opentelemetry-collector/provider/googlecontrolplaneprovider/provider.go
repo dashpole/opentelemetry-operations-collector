@@ -26,6 +26,7 @@ import (
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/processor/googlepolicyprocessor"
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/provider/googlecontrolplaneprovider/policies/gcpdestination"
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/provider/googlecontrolplaneprovider/policies/selfmetrics"
+	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/provider/googlecontrolplaneprovider/policies/windowseventlog"
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/pkg/event"
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-collector/pkg/googlepolicy"
 	_ "github.com/GoogleCloudPlatform/opentelemetry-operations-collector/pkg/googlepolicy/logfilter"
@@ -360,10 +361,11 @@ func (p *provider) evaluatePolicySet(ctx context.Context, collectorID string, fl
 
 	// Load all source policies from the active policy set.
 	sourcePolicies := activePolicySet.LoadPoliciesOfClass(googlepolicy.PolicyClassSource)
+	seenWinEventLogChannels := windowseventlog.NewSeenChannels()
 
 	appliedSelfMetrics := false
 	for _, sp := range sourcePolicies {
-		policyConf, err := p.evaluateSingleSourcePolicy(ctx, collectorID, fleetID, sp, destPolicy, preProcessLogIDs, preProcessMetricIDs, preProcessTraceIDs)
+		policyConf, err := p.evaluateSingleSourcePolicy(ctx, collectorID, fleetID, seenWinEventLogChannels, sp, destPolicy, preProcessLogIDs, preProcessMetricIDs, preProcessTraceIDs)
 		if err != nil {
 			p.recordPolicyEvaluateError(ctx, sp.PolicyName(), activePolicySet, err, event.WithPolicyEvaluateErrorEventPolicyClass(event.PolicyClassSource))
 			continue
@@ -381,7 +383,7 @@ func (p *provider) evaluatePolicySet(ctx context.Context, collectorID string, fl
 	// If no custom self_metrics policy was present or if it failed evaluation,
 	// fall back to BuiltInSelfMetricsPolicy.
 	if !appliedSelfMetrics {
-		policyConf, err := p.evaluateSingleSourcePolicy(ctx, collectorID, fleetID, BuiltInSelfMetricsPolicy, destPolicy, preProcessLogIDs, preProcessMetricIDs, preProcessTraceIDs)
+		policyConf, err := p.evaluateSingleSourcePolicy(ctx, collectorID, fleetID, seenWinEventLogChannels, BuiltInSelfMetricsPolicy, destPolicy, preProcessLogIDs, preProcessMetricIDs, preProcessTraceIDs)
 		if err != nil {
 			p.recordPolicyEvaluateError(ctx, BuiltInSelfMetricsPolicy.PolicyName(), nil, err, event.WithPolicyEvaluateErrorEventPolicyClass(event.PolicyClassSource))
 			return nil, true, err
@@ -420,6 +422,7 @@ func (p *provider) evaluateSingleSourcePolicy(
 	ctx context.Context,
 	collectorID string,
 	fleetID string,
+	seenWinEventLogChannels *windowseventlog.SeenChannels,
 	sp googlepolicy.Policy,
 	destPolicy googlepolicy.DestinationPolicy,
 	preProcessLogIDs []component.ID,
@@ -437,6 +440,9 @@ func (p *provider) evaluateSingleSourcePolicy(
 	switch pol := srcPolicy.(type) {
 	case *selfmetrics.SelfMetricsPolicy:
 		evalCtx := pol.ContextSetup(ctx, collectorID, fleetID)
+		sourceConf, err = pol.Evaluate(evalCtx)
+	case *windowseventlog.WindowsEventLogSourcePolicy:
+		evalCtx := windowseventlog.WithSeenChannels(ctx, seenWinEventLogChannels)
 		sourceConf, err = pol.Evaluate(evalCtx)
 	default:
 		sourceConf, err = srcPolicy.Evaluate(ctx)

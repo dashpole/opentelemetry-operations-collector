@@ -1,0 +1,9 @@
+{
+  "type": "windows_event_log",
+  "id": "02_wec_events",
+  "channels": [
+    "SECURITY",
+    "System",
+    "application"
+  ]
+}

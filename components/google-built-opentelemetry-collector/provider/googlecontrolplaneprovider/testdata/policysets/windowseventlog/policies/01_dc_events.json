@@ -1,0 +1,9 @@
+{
+  "type": "windows_event_log",
+  "id": "01_dc_events",
+  "channels": [
+    "Security",
+    "Application",
+    "security"
+  ]
+}
