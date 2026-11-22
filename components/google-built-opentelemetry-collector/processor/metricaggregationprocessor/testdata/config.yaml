@@ -1,0 +1,21 @@
+window_size: 5m
+bucket_duration: 5s
+max_buckets: 10000
+engine: algebraic_chan
+aggregations:
+  - sum
+  - count
+  - mean
+  - stddev
+  - rate
+variance_mode: sample
+rate_mode: fixed_window
+allow_gauge_rate: false
+max_series: 100000
+idle_ttl: 10m
+max_future_skew: 1m
+fallback_to_arrival_time: false
+emit_interval: 0s
+passthrough_input: false
+metric_names:
+  - http.server.request.duration
